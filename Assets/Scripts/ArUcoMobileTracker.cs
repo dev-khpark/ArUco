@@ -1,0 +1,338 @@
+using System.Collections.Generic;
+using UnityEngine;
+using UnityEngine.UI;
+
+#if UNITY_ANDROID
+using UnityEngine.Android;
+#endif
+
+using OpenCVForUnity.CoreModule;
+using OpenCVForUnity.ArucoModule;
+using OpenCVForUnity.UnityUtils;
+using OpenCVForUnity.ObjdetectModule;
+
+public class ArUcoMobileTracker : MonoBehaviour
+{
+    [Header("Tangram Matching")]
+    [Tooltip("Optional: Assign to enable matching detected shapes to the TangramDiagram children.")]
+    public TangramMatcher tangramMatcher;
+    [Tooltip("Camera transform used to convert ArUco camera-space tvecs to Unity world positions. If null, falls back to main camera.")]
+    public Transform arUcoCameraTransform;
+
+    [Header("UI Settings")]
+    public RawImage rawImageDisplay;  // UI에 보여줄 RawImage
+    
+    [Header("ArUco Settings")]
+    public float markerLength = 0.05f; // 마커 한 변의 실제 길이 (단위: 미터)
+    
+    [Header("Camera Settings")]
+    public bool useFrontCamera = false; // true: 전면 카메라, false: 후면 카메라
+    [Tooltip("카메라 해상도 폭")]
+    public int cameraWidth = 1920;
+    [Tooltip("카메라 해상도 높이")]
+    public int cameraHeight = 1080;
+    [Space]
+    [Tooltip("게임 실행 중 카메라 변경을 위한 버튼 (테스트용)")]
+    public bool switchCameraInRuntime = false;
+
+    private WebCamTexture webcamTexture;
+    private Texture2D texture;
+    private Mat camMat;
+    private Dictionary dictionary;
+    private DetectorParameters detectorParams;
+    private ArucoDetector arucoDetector;
+    
+    // 카메라 관리용 변수들
+    private bool lastUseFrontCamera;
+    private bool lastSwitchCameraInRuntime;
+
+    private Mat ids;
+    private List<Mat> corners;
+    private Mat rvecs;
+    private Mat tvecs;
+
+    // 예시용 기본 카메라 행렬 및 왜곡 계수
+    private Mat camMatrix;
+    private Mat distCoeffs;
+
+    private bool TryMapArucoIdToShape(int arucoId, out TangramMatcher.TangramShapeType shapeType)
+    {
+        switch (arucoId)
+        {
+            case 0: shapeType = TangramMatcher.TangramShapeType.LargeTriangle; return true;
+            case 1: shapeType = TangramMatcher.TangramShapeType.MediumTriangle; return true;
+            case 2: shapeType = TangramMatcher.TangramShapeType.SmallTriangle; return true;
+            case 3: shapeType = TangramMatcher.TangramShapeType.Square; return true;
+            case 4: shapeType = TangramMatcher.TangramShapeType.Parallelogram; return true;
+            default:
+                shapeType = default;
+                return false;
+        }
+    }
+
+    void Start()
+    {
+        RequestCameraPermission();
+
+        // 초기화 - ArUco 딕셔너리와 감지 파라미터 설정
+        dictionary = Objdetect.getPredefinedDictionary(Objdetect.DICT_4X4_50);
+        detectorParams = new DetectorParameters();
+        arucoDetector = new ArucoDetector(dictionary, detectorParams);
+
+        ids = new Mat();
+        corners = new List<Mat>();
+        rvecs = new Mat();
+        tvecs = new Mat();
+
+        // 카메라 행렬과 왜곡 계수 예시값 (기본값, 정확한 위치 추정 원할 경우 캘리브레이션 필요)
+        double fx = 800, fy = 800, cx = 320, cy = 240;
+        camMatrix = new Mat(3, 3, CvType.CV_64F);
+        camMatrix.put(0, 0, fx); camMatrix.put(0, 1, 0);  camMatrix.put(0, 2, cx);
+        camMatrix.put(1, 0, 0);  camMatrix.put(1, 1, fy); camMatrix.put(1, 2, cy);
+        camMatrix.put(2, 0, 0);  camMatrix.put(2, 1, 0);  camMatrix.put(2, 2, 1);
+
+        distCoeffs = new MatOfDouble(0, 0, 0, 0); // 왜곡 계수 없음 처리
+
+        // 카메라 시작
+        lastUseFrontCamera = useFrontCamera;
+        lastSwitchCameraInRuntime = switchCameraInRuntime;
+        StartWebCam();
+    }
+
+    void RequestCameraPermission()
+    {
+#if UNITY_ANDROID
+        if (!Permission.HasUserAuthorizedPermission(Permission.Camera))
+        {
+            Permission.RequestUserPermission(Permission.Camera);
+        }
+#endif
+    }
+
+    void StartWebCam()
+    {
+        WebCamDevice[] devices = WebCamTexture.devices;
+        if (devices.Length > 0)
+        {
+            string selectedCameraName = GetSelectedCamera(devices);
+            
+            if (!string.IsNullOrEmpty(selectedCameraName))
+            {
+                webcamTexture = new WebCamTexture(selectedCameraName, cameraWidth, cameraHeight);
+                webcamTexture.Play();
+
+                rawImageDisplay.texture = webcamTexture;
+                rawImageDisplay.material.mainTexture = webcamTexture;
+                // Camera successfully started, print debug information in English
+                Debug.Log($"Camera started: {selectedCameraName} ({cameraWidth}x{cameraHeight})");
+            }
+            else
+            {
+                Debug.LogError("Could not find the selected camera!");
+            }
+        }
+        else
+        {
+            Debug.LogError("No available camera devices found!");
+        }
+    }
+
+    string GetSelectedCamera(WebCamDevice[] devices)
+    {
+        // 사용 가능한 모든 카메라 로그 출력
+            // Print the number of available cameras in English
+            Debug.Log($"Number of available cameras: {devices.Length}");
+            for (int i = 0; i < devices.Length; i++)
+            {
+                Debug.Log($"Camera {i}: {devices[i].name}, isFrontFacing: {devices[i].isFrontFacing}");
+            }
+
+            // 원하는 카메라 찾기
+        for (int i = 0; i < devices.Length; i++)
+        {
+            if (devices[i].isFrontFacing == useFrontCamera)
+            {
+                return devices[i].name;
+            }
+        }
+
+        // If the desired camera is not found, use the first available camera.
+        Debug.LogWarning($"Could not find the desired camera (front: {useFrontCamera}). Using the first available camera instead.");
+        return devices[0].name;
+    }
+
+    void Update()
+    {
+        // Detect runtime camera change
+        if (lastUseFrontCamera != useFrontCamera || 
+            (switchCameraInRuntime && !lastSwitchCameraInRuntime))
+        {
+            lastUseFrontCamera = useFrontCamera;
+            lastSwitchCameraInRuntime = switchCameraInRuntime;
+            
+            Debug.Log($"Camera change detected: Using front camera = {useFrontCamera}");
+            SwitchCamera();
+        }
+        
+        if (webcamTexture == null || !webcamTexture.isPlaying || !webcamTexture.didUpdateThisFrame)
+            return;
+
+        // 카메라 프레임을 Mat으로 변환
+        if (camMat == null || camMat.width() != webcamTexture.width || camMat.height() != webcamTexture.height)
+        {
+            camMat = new Mat(webcamTexture.height, webcamTexture.width, CvType.CV_8UC3);
+        }
+
+        Utils.webCamTextureToMat(webcamTexture, camMat);
+
+        // ArUco 마커 감지
+        arucoDetector.detectMarkers(camMat, corners, ids);
+
+        if (ids.total() > 0)
+        {
+            Objdetect.drawDetectedMarkers(camMat, corners, ids);
+
+            // 위치 및 회전 추정
+            Aruco.estimatePoseSingleMarkers(corners, markerLength, camMatrix, distCoeffs, rvecs, tvecs);
+
+            for (int i = 0; i < ids.total(); i++)
+            {
+                // 포즈 정보 출력
+                int id = (int)ids.get(i, 0)[0];
+                double[] t = tvecs.get(i, 0); // (x, y, z)
+                double[] r = rvecs.get(i, 0); // 회전 벡터
+
+                // Debug output in English for detected ArUco marker position and rotation vector
+                Debug.Log($"[ArUco ID: {id}] Position (meters): X={t[0]:F2}, Y={t[1]:F2}, Z={t[2]:F2}");
+                Debug.Log($"[ArUco ID: {id}] Rotation Vector: X={r[0]:F2}, Y={r[1]:F2}, Z={r[2]:F2}");
+
+                // 필요 시, rvec -> 회전 행렬 -> Quaternion 변환 후 Unity 오브젝트에 적용 가능
+            }
+
+            // Forward detections to TangramMatcher for comparison/highlighting
+            if (tangramMatcher != null)
+            {
+                var camTr = arUcoCameraTransform != null ? arUcoCameraTransform : (Camera.main != null ? Camera.main.transform : null);
+                if (camTr == null)
+                {
+                    Debug.LogWarning("ArUcoMobileTracker: No camera transform available for world conversion; skipping Tangram matching this frame.");
+                }
+                else
+                {
+                    List<TangramMatcher.DetectedShape> detections = new List<TangramMatcher.DetectedShape>();
+                    int count = (int)ids.total();
+                    for (int i = 0; i < count; i++)
+                    {
+                        int arucoId = (int)ids.get(i, 0)[0];
+                        if (!TryMapArucoIdToShape(arucoId, out TangramMatcher.TangramShapeType type))
+                            continue;
+
+                        double[] t = tvecs.get(i, 0);
+                        Vector3 posCamera = new Vector3((float)t[0], (float)(-t[1]), (float)t[2]);
+                        Vector3 worldPos = camTr.TransformPoint(posCamera);
+
+                        detections.Add(new TangramMatcher.DetectedShape
+                        {
+                            arucoId = arucoId,
+                            shapeType = type,
+                            worldPosition = worldPos,
+                            worldRotation = Quaternion.identity,
+                            confidence = 1f
+                        });
+                    }
+
+                    // Pass detections and let the matcher highlight matches
+                    tangramMatcher.SetDetections(detections);
+                }
+            }
+        }
+
+        // 화면 출력
+        if (texture == null || texture.width != camMat.width() || texture.height != camMat.height())
+        {
+            texture = new Texture2D(camMat.width(), camMat.height(), TextureFormat.RGBA32, false);
+            rawImageDisplay.texture = texture;
+        }
+
+        Utils.matToTexture2D(camMat, texture);
+    }
+
+    void SwitchCamera()
+    {
+        // 기존 카메라 정지 및 정리
+        if (webcamTexture != null)
+        {
+            webcamTexture.Stop();
+            webcamTexture = null;
+        }
+        
+        // 새 카메라 시작
+        StartWebCam();
+        
+        // 화면 전환 시 텍스처 초기화
+        if (texture != null)
+        {
+            DestroyImmediate(texture);
+            texture = null;
+        }
+        
+        // Mat 객체 초기화
+        if (camMat != null)
+        {
+            camMat.Dispose();
+            camMat = null;
+        }
+    }
+
+    void OnDestroy()
+    {
+        // 리소스 정리
+        if (webcamTexture != null)
+        {
+            webcamTexture.Stop();
+            webcamTexture = null;
+        }
+        
+        if (texture != null)
+        {
+            DestroyImmediate(texture);
+            texture = null;
+        }
+        
+        if (camMat != null)
+        {
+            camMat.Dispose();
+            camMat = null;
+        }
+        
+        if (ids != null)
+        {
+            ids.Dispose();
+            ids = null;
+        }
+        
+        if (rvecs != null)
+        {
+            rvecs.Dispose();
+            rvecs = null;
+        }
+        
+        if (tvecs != null)
+        {
+            tvecs.Dispose();
+            tvecs = null;
+        }
+        
+        if (camMatrix != null)
+        {
+            camMatrix.Dispose();
+            camMatrix = null;
+        }
+        
+        if (distCoeffs != null)
+        {
+            distCoeffs.Dispose();
+            distCoeffs = null;
+        }
+    }
+}
