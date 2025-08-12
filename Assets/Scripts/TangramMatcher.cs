@@ -107,6 +107,36 @@ public class TangramMatcher : MonoBehaviour
     [Tooltip("Log pairwise neighbor angle checks for debugging.")]
     public bool debugLogPairwiseAngles = true;
 
+    [Header("Color Application")]
+    [Tooltip("If set, use this shader color property name (e.g., _BaseColor, _Color). If empty, auto-detect common names.")]
+    public string overrideColorProperty = "";
+    [Tooltip("If no color property is found on the material, assign Renderer.material.color as a fallback (instantiates material).")]
+    public bool fallbackUseMaterialColorWhenNoProperty = true;
+
+    [Header("Neutral Color Mode")]
+    [Tooltip("If true, all diagram pieces are set to a neutral color initially, and only matched pieces restore their original colors.")]
+    public bool useNeutralColorMode = true;
+    [Tooltip("Neutral color applied to all unmatched pieces.")]
+    public Color neutralColor = Color.gray;
+    [Tooltip("When using neutral color mode, matched pieces restore their captured original color instead of debug colors.")]
+    public bool matchedRestoresOriginalColor = true;
+
+    [Header("Projection & Scale Normalization")]
+    [Tooltip("Project all relation computations onto the diagram plane (reduces perspective effects).")]
+    public bool usePlanarProjectionForRelations = true;
+    [Tooltip("When comparing distances, estimate and apply a scalar scale factor from detection neighbors to diagram neighbors to reduce perspective-induced scale error.")]
+    public bool useScaleNormalization = true;
+    [Tooltip("Use only the nearest already-matched neighbor to compute relation cost (simpler and more stable with sparse links).")]
+    public bool useOnlyNearestMatchedNeighbor = true;
+
+    [Header("Temporal Smoothing")]
+    [Tooltip("Stabilize matches by aggregating the last N frames before deciding final highlight.")]
+    public bool useTemporalSmoothing = true;
+    [Tooltip("Number of frames to aggregate.")]
+    public int temporalWindowSize = 5;
+    [Tooltip("Minimum votes within the window required to accept a piece as matched (per type). 0 = disabled (always pick top-K by votes).")]
+    public int temporalMinVotes = 0;
+
     /// <summary>
     /// Types of Tangram shapes supported.
     /// </summary>
@@ -171,6 +201,26 @@ public class TangramMatcher : MonoBehaviour
     // MaterialPropertyBlock to avoid material instantiation
     private MaterialPropertyBlock sharedPropertyBlock;
     private GUIStyle cachedLabelStyle;
+    
+    // Temporal memory: for each piece, keep a circular buffer of votes
+    private class TemporalVotes
+    {
+        public int[] buffer;
+        public int index;
+        public int count;
+    }
+    private readonly Dictionary<Transform, TemporalVotes> votesByPiece = new Dictionary<Transform, TemporalVotes>();
+    private int temporalFrameCounter = 0;
+    
+    // Original color cache per renderer/material index
+    private class SubMaterialColorInfo
+    {
+        public string propertyName; // null if none
+        public Color originalColor;
+        public bool hasColorProperty;
+        public Color fallbackOriginalColor;
+    }
+    private readonly Dictionary<MeshRenderer, List<SubMaterialColorInfo>> originalColorsByRenderer = new Dictionary<MeshRenderer, List<SubMaterialColorInfo>>();
 
     // Diagram graph
     private class DiagramGraph
@@ -245,6 +295,21 @@ public class TangramMatcher : MonoBehaviour
         if (debugLogDiagramGraph)
         {
             DebugLogDiagramGraph();
+        }
+
+        // Capture original colors for all pieces
+        CaptureOriginalColors();
+
+        // Apply neutral color to all pieces at start if enabled
+        if (useNeutralColorMode)
+        {
+            foreach (var kv in diagramPiecesByType)
+            {
+                foreach (Transform piece in kv.Value)
+                {
+                    SetRendererColor(piece.gameObject, neutralColor);
+                }
+            }
         }
     }
 
@@ -363,7 +428,10 @@ public class TangramMatcher : MonoBehaviour
         // Error stats per type
         ComputeAndStoreErrorStats();
 
-        ApplyDebugColors(matchedPieceSet);
+        // Temporal smoothing: convert instantaneous matches to stable set
+        var stableSet = useTemporalSmoothing ? GetStableMatchedSet(matchedPieceSet) : matchedPieceSet;
+
+        ApplyDebugColors(stableSet);
 
         // Draw debug lines for visual error
         if (debugDrawErrorLines)
@@ -404,14 +472,22 @@ public class TangramMatcher : MonoBehaviour
 
     private void ApplyDebugColors(HashSet<Transform> matchedPieces)
     {
-        // First, optionally reset all to unmatched color
-        if (!highlightOnlyMatches)
+        // First, update unmatched pieces
+        foreach (var kv in diagramPiecesByType)
         {
-            foreach (var kv in diagramPiecesByType)
+            foreach (Transform piece in kv.Value)
             {
-                foreach (Transform piece in kv.Value)
+                if (matchedPieces.Contains(piece)) continue;
+                if (useNeutralColorMode)
                 {
-                    SetRendererColor(piece.gameObject, unmatchedColor);
+                    SetRendererColor(piece.gameObject, neutralColor);
+                }
+                else
+                {
+                    if (highlightOnlyMatches)
+                        RestoreRendererOriginalColor(piece.gameObject);
+                    else
+                        SetRendererColor(piece.gameObject, unmatchedColor);
                 }
             }
         }
@@ -419,7 +495,11 @@ public class TangramMatcher : MonoBehaviour
         // Then, set matched pieces to color (optionally by error magnitude)
         foreach (Transform piece in matchedPieces)
         {
-            if (colorByErrorMagnitude)
+            if (useNeutralColorMode && matchedRestoresOriginalColor)
+            {
+                RestoreRendererOriginalColor(piece.gameObject);
+            }
+            else if (colorByErrorMagnitude)
             {
                 // Find distance for this piece from last results
                 float dist = 0f;
@@ -449,6 +529,136 @@ public class TangramMatcher : MonoBehaviour
                 SetRendererColor(piece.gameObject, matchedColor);
             }
         }
+    }
+
+    private void CaptureOriginalColors()
+    {
+        originalColorsByRenderer.Clear();
+        var candidateProps = string.IsNullOrEmpty(overrideColorProperty)
+            ? new[] { "_BaseColor", "_Color", "_TintColor" }
+            : new[] { overrideColorProperty };
+        foreach (var kv in diagramPiecesByType)
+        {
+            foreach (Transform piece in kv.Value)
+            {
+                var renderer = piece.GetComponent<MeshRenderer>();
+                if (renderer == null) continue;
+                var list = new List<SubMaterialColorInfo>();
+                var sharedMats = renderer.sharedMaterials;
+                for (int m = 0; m < sharedMats.Length; m++)
+                {
+                    var info = new SubMaterialColorInfo
+                    {
+                        propertyName = null,
+                        originalColor = Color.white,
+                        hasColorProperty = false,
+                        fallbackOriginalColor = Color.white
+                    };
+                    var sm = sharedMats[m];
+                    if (sm != null)
+                    {
+                        foreach (var prop in candidateProps)
+                        {
+                            if (sm.HasProperty(prop))
+                            {
+                                info.propertyName = prop;
+                                try { info.originalColor = sm.GetColor(prop); }
+                                catch { info.originalColor = Color.white; }
+                                info.hasColorProperty = true;
+                                break;
+                            }
+                        }
+                        // Fallback: try reading material.color via a temp instantiation-read pattern avoided; assume white if unknown
+                        try
+                        {
+                            // Note: sharedMaterial.color may not be valid if shader has no _Color
+                            info.fallbackOriginalColor = sm.color;
+                        }
+                        catch { info.fallbackOriginalColor = Color.white; }
+                    }
+                    list.Add(info);
+                }
+                originalColorsByRenderer[renderer] = list;
+                // Initialize temporal votes
+                if (!votesByPiece.ContainsKey(piece))
+                {
+                    votesByPiece[piece] = new TemporalVotes { buffer = new int[Mathf.Max(1, temporalWindowSize)], index = 0, count = 0 };
+                }
+            }
+        }
+    }
+
+    private void RestoreRendererOriginalColor(GameObject go)
+    {
+        var renderer = go.GetComponent<MeshRenderer>();
+        if (renderer == null) return;
+        if (!originalColorsByRenderer.TryGetValue(renderer, out var list)) return;
+
+        // Restore via property block or fallback material.color
+        for (int m = 0; m < list.Count; m++)
+        {
+            var info = list[m];
+            if (info.hasColorProperty && !string.IsNullOrEmpty(info.propertyName))
+            {
+                if (sharedPropertyBlock == null) sharedPropertyBlock = new MaterialPropertyBlock();
+                renderer.GetPropertyBlock(sharedPropertyBlock, m);
+                sharedPropertyBlock.SetColor(info.propertyName, info.originalColor);
+                renderer.SetPropertyBlock(sharedPropertyBlock, m);
+            }
+            else if (fallbackUseMaterialColorWhenNoProperty)
+            {
+                try
+                {
+                    var mats = renderer.materials;
+                    if (m < mats.Length && mats[m] != null)
+                    {
+                        mats[m].color = info.fallbackOriginalColor;
+                    }
+                }
+                catch { /* ignore */ }
+            }
+        }
+    }
+
+    private HashSet<Transform> GetStableMatchedSet(HashSet<Transform> instantaneous)
+    {
+        temporalFrameCounter++;
+        // Update votes ring buffer
+        foreach (var kv in diagramPiecesByType)
+        {
+            foreach (Transform piece in kv.Value)
+            {
+                if (!votesByPiece.TryGetValue(piece, out var tv))
+                {
+                    tv = new TemporalVotes { buffer = new int[Mathf.Max(1, temporalWindowSize)], index = 0, count = 0 };
+                    votesByPiece[piece] = tv;
+                }
+                if (tv.buffer.Length != temporalWindowSize)
+                {
+                    tv.buffer = new int[Mathf.Max(1, temporalWindowSize)];
+                    tv.index = 0; tv.count = 0;
+                }
+                // write vote
+                tv.buffer[tv.index] = instantaneous.Contains(piece) ? 1 : 0;
+                tv.index = (tv.index + 1) % tv.buffer.Length;
+                if (tv.count < tv.buffer.Length) tv.count++;
+            }
+        }
+
+        // Derive stable set
+        var stable = new HashSet<Transform>();
+        foreach (var kv in diagramPiecesByType)
+        {
+            foreach (Transform piece in kv.Value)
+            {
+                var tv = votesByPiece[piece];
+                int sum = 0; for (int i = 0; i < tv.count; i++) sum += tv.buffer[i];
+                // If temporalMinVotes > 0, require at least that many; else pick majority (> half)
+                int threshold = temporalMinVotes > 0 ? temporalMinVotes : Mathf.Max(1, tv.buffer.Length / 2 + 1);
+                if (sum >= threshold) stable.Add(piece);
+            }
+        }
+        return stable;
     }
 
     // ---------- Diagram Graph Construction ----------
@@ -583,11 +793,14 @@ public class TangramMatcher : MonoBehaviour
         foreach (var kv in availablePieces) remainingByType[kv.Key] = new List<Transform>(kv.Value);
 
         var detToPiece = new Dictionary<int, Transform>();
+        var assignedDetectionIndices = new HashSet<int>();
         bool seeded = false;
 
         for (int oi = 0; oi < order.Count; oi++)
         {
             int nodeIdx = order[oi];
+            if (assignedDetectionIndices.Contains(nodeIdx))
+                continue;
             var node = dg.nodes[nodeIdx];
 
             if (!remainingByType.TryGetValue(node.type, out var candidates) || candidates.Count == 0)
@@ -616,6 +829,98 @@ public class TangramMatcher : MonoBehaviour
                     continue; // no graph-consistent options, skip
             }
 
+            // Multi-detection assignment for duplicate types: choose configuration that maximizes number of matches, then minimal total cost
+            if (remainingByType.TryGetValue(node.type, out var remainingForType) && remainingForType.Count >= 2)
+            {
+                var detIndices = new List<int>();
+                // collect current and subsequent unmatched detections of same type having at least one matched neighbor
+                for (int oj = oi; oj < order.Count; oj++)
+                {
+                    int candIdx = order[oj];
+                    if (assignedDetectionIndices.Contains(candIdx)) continue;
+                    var candNode = dg.nodes[candIdx];
+                    if (candNode.type != node.type) continue;
+                    bool hasMatchedNeighbor = false;
+                    foreach (int nn in candNode.neighbors) { if (detToPiece.ContainsKey(nn)) { hasMatchedNeighbor = true; break; } }
+                    if (!hasMatchedNeighbor) continue;
+                    detIndices.Add(candIdx);
+                }
+                if (detIndices.Count >= 2)
+                {
+                    // Build union candidate pool filtered by graph neighbors per detection
+                    var pool = new List<Transform>();
+                    foreach (int di in detIndices)
+                    {
+                        var neighSet = new HashSet<Transform>();
+                        foreach (int nn in dg.nodes[di].neighbors) { if (detToPiece.TryGetValue(nn, out var np)) neighSet.Add(np); }
+                        var filtered = FilterCandidatesByAnyGraphNeighbor(neighSet, remainingForType);
+                        foreach (var p in filtered) if (!pool.Contains(p)) pool.Add(p);
+                    }
+                    if (pool.Count > 0)
+                    {
+                        // Build all feasible pairs with costs
+                        var pairs = new List<(int di, Transform piece, float cost, float d, float a)>();
+                        foreach (int di in detIndices)
+                        {
+                            foreach (var p in pool)
+                            {
+                                if (!TryComputeRelationalCostForCandidate(di, p, dg, detToPiece, out float d, out float a, out _, out int cnt))
+                                    continue;
+                                if (d <= graphDistanceToleranceMeters && a <= graphAngleToleranceDeg)
+                                {
+                                    float cost = d + rotationWeightMetersPerDeg * a;
+                                    pairs.Add((di, p, cost, d, a));
+                                }
+                            }
+                        }
+                        // Greedy by ascending cost to maximize matches
+                        pairs.Sort((x, y) => x.cost.CompareTo(y.cost));
+                        var usedDet = new HashSet<int>();
+                        var usedPiece = new HashSet<Transform>();
+                        foreach (var pr in pairs)
+                        {
+                            if (usedDet.Contains(pr.di) || usedPiece.Contains(pr.piece)) continue;
+                            usedDet.Add(pr.di); usedPiece.Add(pr.piece);
+                        }
+                        if (usedDet.Count > 0)
+                        {
+                            // Commit selected matches
+                            foreach (var pr in pairs)
+                            {
+                                if (!usedDet.Contains(pr.di) || !usedPiece.Contains(pr.piece)) continue;
+                            }
+                            // Actually iterate again to commit in order to keep logs and results clean
+                            var committed = new HashSet<int>();
+                            var committedPieces = new HashSet<Transform>();
+                            foreach (var pr in pairs)
+                            {
+                                if (committed.Contains(pr.di) || committedPieces.Contains(pr.piece)) continue;
+                                if (!usedDet.Contains(pr.di) || !usedPiece.Contains(pr.piece)) continue;
+                                int di = pr.di; var piece = pr.piece;
+                                detToPiece[di] = piece;
+                                assignedDetectionIndices.Add(di);
+                                remainingForType.Remove(piece);
+                                matchedPieceSet.Add(piece);
+                                var det = latestDetections[dg.nodes[di].detIndex];
+                                lastMatchResults.Add(new MatchResult
+                                {
+                                    shapeType = det.shapeType,
+                                    arucoId = det.arucoId,
+                                    matchedPieceTransform = piece,
+                                    worldDistanceMeters = pr.d,
+                                    detectionWorldPosition = det.worldPosition,
+                                    angleErrorDegrees = pr.a
+                                });
+                                linkSegments.Add((det.worldPosition, piece.position, pr.d, piece, det.shapeType, det.arucoId));
+                                committed.Add(di); committedPieces.Add(piece);
+                            }
+                            // Move to next after committing this type group
+                            continue;
+                        }
+                    }
+                }
+            }
+
             if (neighborMatchedPieces.Count == 0 && !seeded)
             {
                 // Seed: pick diagram piece with highest graph degree among candidates
@@ -641,52 +946,33 @@ public class TangramMatcher : MonoBehaviour
             }
             else
             {
-                // Relational cost against already matched neighbors only (no absolute coords)
+                // Relational cost using only the nearest already-matched neighbor
                 var nearMissList = new List<(Transform p, float avgDistDiff, float avgAngDiff, float cost)>();
                 foreach (var p in filteredCandidates)
                 {
-                    float sumDistDiff = 0f;
-                    float sumAngDiff = 0f;
-                    int count = 0;
-                    // For pairwise check, cache involved neighbor vectors
-                    var detNeighborDirs = new List<Vector3>();
-                    var diagNeighborDirs = new List<Vector3>();
+                    // find nearest matched neighbor in detection graph
+                    int nearestIdx = -1; float nearestDet = float.PositiveInfinity; Transform nearestPiece = null;
                     foreach (int nIdx in node.neighbors)
                     {
-                        if (!detToPiece.TryGetValue(nIdx, out var neighborPiece))
-                            continue;
-                        // detection relation
-                        Vector3 vDet = dg.nodes[nIdx].pos - node.pos; // from center->neighbor direction
-                        // diagram relation
-                        Vector3 vDiag = neighborPiece.position - p.position; // center->neighbor
-                        float distDiff = Mathf.Abs(vDet.magnitude - vDiag.magnitude);
-                        float angDiff = ComputePlanarAngleBetweenVectors(vDet, vDiag);
-                        sumDistDiff += distDiff;
-                        sumAngDiff += angDiff;
-                        detNeighborDirs.Add(vDet);
-                        diagNeighborDirs.Add(vDiag);
-                        count++;
+                        if (!detToPiece.TryGetValue(nIdx, out var np)) continue;
+                        float d = Vector3.Distance(dg.nodes[nIdx].pos, node.pos);
+                        if (d < nearestDet) { nearestDet = d; nearestIdx = nIdx; nearestPiece = np; }
                     }
-                    if (count == 0)
-                        continue; // no neighbor constraints available
-                    float avgDistDiff = sumDistDiff / count;
-                    float avgAngDiff = sumAngDiff / count;
-                    // Optional pairwise angle preservation (e.g., A-B-C expects ~180°)
-                    if (usePairwiseNeighborAngle && detNeighborDirs.Count >= 2)
+                    if (nearestIdx < 0) continue; // no neighbor constraints available
+
+                    Vector3 vDet = dg.nodes[nearestIdx].pos - node.pos;
+                    Vector3 vDiag = nearestPiece.position - p.position;
+                    if (usePlanarProjectionForRelations)
                     {
-                        float detPairAvg = ComputeAveragePairwiseAngle(detNeighborDirs);
-                        float diagPairAvg = ComputeAveragePairwiseAngle(diagNeighborDirs);
-                        float pairDiff = Mathf.Abs(NormalizeAngle180(detPairAvg - diagPairAvg));
-                        if (debugLogPairwiseAngles)
-                        {
-                            Debug.Log($"[TangramMatcher] pairwise angle check at det({node.type}) vs diag({p.name}): detAvg={detPairAvg:F1} deg, diagAvg={diagPairAvg:F1} deg, diff={pairDiff:F1} deg");
-                        }
-                        if (pairDiff > pairwiseAngleToleranceDeg)
-                        {
-                            // treat as near-miss with heavy penalty to avoid selection
-                            avgAngDiff += pairDiff;
-                        }
+                        Vector3 nrm = tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up;
+                        vDet = Vector3.ProjectOnPlane(vDet, nrm);
+                        vDiag = Vector3.ProjectOnPlane(vDiag, nrm);
                     }
+                    float scaleFactor = 1f;
+                    if (useScaleNormalization && vDiag.magnitude > 1e-4f)
+                        scaleFactor = vDet.magnitude / vDiag.magnitude;
+                    float avgDistDiff = Mathf.Abs(vDet.magnitude - vDiag.magnitude * scaleFactor);
+                    float avgAngDiff = ComputePlanarAngleBetweenVectors(vDet, vDiag);
                     float cost = avgDistDiff + rotationWeightMetersPerDeg * avgAngDiff;
                     bool passes = avgDistDiff <= graphDistanceToleranceMeters && avgAngDiff <= graphAngleToleranceDeg;
                     if (passes)
@@ -730,6 +1016,7 @@ public class TangramMatcher : MonoBehaviour
             if (chosen != null)
             {
                 detToPiece[nodeIdx] = chosen;
+                assignedDetectionIndices.Add(nodeIdx);
                 remainingByType[node.type].Remove(chosen);
                 matchedPieceSet.Add(chosen);
                 var det = latestDetections[node.detIndex];
@@ -842,6 +1129,54 @@ public class TangramMatcher : MonoBehaviour
         }
     }
 
+    private bool TryComputeRelationalCostForCandidate(int nodeIdx, Transform candidatePiece, DetectionGraph dg, Dictionary<int, Transform> detToPiece,
+        out float avgDistDiff, out float avgAngDiff, out float usedScale, out int usedCount)
+    {
+        float sumDist = 0f, sumAng = 0f; int count = 0; usedScale = 1f;
+        var scaleSamples = new List<float>();
+        var center = dg.nodes[nodeIdx];
+        foreach (int nIdx in center.neighbors)
+        {
+            if (!detToPiece.TryGetValue(nIdx, out var neighborPiece)) continue;
+            Vector3 vDet = dg.nodes[nIdx].pos - center.pos;
+            Vector3 vDiag = neighborPiece.position - candidatePiece.position;
+            if (usePlanarProjectionForRelations)
+            {
+                Vector3 nrm = tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up;
+                vDet = Vector3.ProjectOnPlane(vDet, nrm);
+                vDiag = Vector3.ProjectOnPlane(vDiag, nrm);
+            }
+            sumDist += Mathf.Abs(vDet.magnitude - vDiag.magnitude);
+            sumAng += ComputePlanarAngleBetweenVectors(vDet, vDiag);
+            if (useScaleNormalization && vDiag.magnitude > 1e-4f)
+                scaleSamples.Add(vDet.magnitude / vDiag.magnitude);
+            count++;
+        }
+        if (count == 0) { avgDistDiff = 0f; avgAngDiff = 0f; usedCount = 0; return false; }
+        if (useScaleNormalization && scaleSamples.Count > 0)
+        {
+            scaleSamples.Sort(); usedScale = scaleSamples[scaleSamples.Count / 2];
+            // recompute distance diff with scale
+            sumDist = 0f; int rc = 0;
+            foreach (int nIdx in center.neighbors)
+            {
+                if (!detToPiece.TryGetValue(nIdx, out var neighborPiece)) continue;
+                Vector3 vDet = dg.nodes[nIdx].pos - center.pos;
+                Vector3 vDiag = neighborPiece.position - candidatePiece.position;
+                if (usePlanarProjectionForRelations)
+                {
+                    Vector3 nrm = tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up;
+                    vDet = Vector3.ProjectOnPlane(vDet, nrm);
+                    vDiag = Vector3.ProjectOnPlane(vDiag, nrm);
+                }
+                sumDist += Mathf.Abs(vDet.magnitude - vDiag.magnitude * usedScale);
+                rc++;
+            }
+            if (rc > 0) count = rc;
+        }
+        avgDistDiff = sumDist / count; avgAngDiff = sumAng / count; usedCount = count; return true;
+    }
+
     private float EstimatePieceSizeMeters(Transform piece)
     {
         // Estimate by renderer bounds extents magnitude (approximate scale/size)
@@ -877,10 +1212,7 @@ public class TangramMatcher : MonoBehaviour
         a.Normalize();
         b.Normalize();
         float ang = Mathf.Abs(Vector3.SignedAngle(a, b, planeNormal));
-        ang = Mathf.Abs(NormalizeAngle180(ang));
-        // Use undirected angle for collinearity (0° and 180° both treated as aligned)
-        if (ang > 90f) ang = 180f - ang;
-        return ang;
+        return Mathf.Abs(NormalizeAngle180(ang));
     }
 
     private float ComputeAveragePairwiseAngle(List<Vector3> dirs)
@@ -978,9 +1310,49 @@ public class TangramMatcher : MonoBehaviour
         if (sharedPropertyBlock == null)
             sharedPropertyBlock = new MaterialPropertyBlock();
 
-        renderer.GetPropertyBlock(sharedPropertyBlock);
-        sharedPropertyBlock.SetColor("_Color", color);
-        renderer.SetPropertyBlock(sharedPropertyBlock);
+        // Try property block first (non-instancing); support multi-material renderers
+        string[] candidateProps = string.IsNullOrEmpty(overrideColorProperty)
+            ? new[] { "_BaseColor", "_Color", "_TintColor" }
+            : new[] { overrideColorProperty };
+        bool applied = false;
+        var sharedMats = renderer.sharedMaterials;
+        for (int m = 0; m < sharedMats.Length; m++)
+        {
+            var sm = sharedMats[m];
+            if (sm == null) continue;
+            foreach (var prop in candidateProps)
+            {
+                if (sm.HasProperty(prop))
+                {
+                    renderer.GetPropertyBlock(sharedPropertyBlock, m);
+                    sharedPropertyBlock.SetColor(prop, color);
+                    renderer.SetPropertyBlock(sharedPropertyBlock, m);
+                    applied = true;
+                    break;
+                }
+            }
+        }
+
+        // Fallback: instantiate material and set .color (only if allowed)
+        if (!applied && fallbackUseMaterialColorWhenNoProperty)
+        {
+            try
+            {
+                // Apply to all instantiated materials if needed
+                var mats = renderer.materials;
+                for (int i = 0; i < mats.Length; i++)
+                {
+                    if (mats[i] != null)
+                    {
+                        mats[i].color = color;
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"[TangramMatcher] Failed to set material color on {go.name}: {e.Message}");
+            }
+        }
     }
 
     void OnGUI()
