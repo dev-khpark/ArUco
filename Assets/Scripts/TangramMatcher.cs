@@ -129,14 +129,6 @@ public class TangramMatcher : MonoBehaviour
     [Tooltip("Use only the nearest already-matched neighbor to compute relation cost (simpler and more stable with sparse links).")]
     public bool useOnlyNearestMatchedNeighbor = true;
 
-    [Header("Temporal Smoothing")]
-    [Tooltip("Stabilize matches by aggregating the last N frames before deciding final highlight.")]
-    public bool useTemporalSmoothing = true;
-    [Tooltip("Number of frames to aggregate.")]
-    public int temporalWindowSize = 5;
-    [Tooltip("Minimum votes within the window required to accept a piece as matched (per type). 0 = disabled (always pick top-K by votes).")]
-    public int temporalMinVotes = 0;
-
     /// <summary>
     /// Types of Tangram shapes supported.
     /// </summary>
@@ -201,16 +193,6 @@ public class TangramMatcher : MonoBehaviour
     // MaterialPropertyBlock to avoid material instantiation
     private MaterialPropertyBlock sharedPropertyBlock;
     private GUIStyle cachedLabelStyle;
-    
-    // Temporal memory: for each piece, keep a circular buffer of votes
-    private class TemporalVotes
-    {
-        public int[] buffer;
-        public int index;
-        public int count;
-    }
-    private readonly Dictionary<Transform, TemporalVotes> votesByPiece = new Dictionary<Transform, TemporalVotes>();
-    private int temporalFrameCounter = 0;
     
     // Original color cache per renderer/material index
     private class SubMaterialColorInfo
@@ -428,10 +410,7 @@ public class TangramMatcher : MonoBehaviour
         // Error stats per type
         ComputeAndStoreErrorStats();
 
-        // Temporal smoothing: convert instantaneous matches to stable set
-        var stableSet = useTemporalSmoothing ? GetStableMatchedSet(matchedPieceSet) : matchedPieceSet;
-
-        ApplyDebugColors(stableSet);
+        ApplyDebugColors(matchedPieceSet);
 
         // Draw debug lines for visual error
         if (debugDrawErrorLines)
@@ -579,11 +558,6 @@ public class TangramMatcher : MonoBehaviour
                     list.Add(info);
                 }
                 originalColorsByRenderer[renderer] = list;
-                // Initialize temporal votes
-                if (!votesByPiece.ContainsKey(piece))
-                {
-                    votesByPiece[piece] = new TemporalVotes { buffer = new int[Mathf.Max(1, temporalWindowSize)], index = 0, count = 0 };
-                }
             }
         }
     }
@@ -618,47 +592,6 @@ public class TangramMatcher : MonoBehaviour
                 catch { /* ignore */ }
             }
         }
-    }
-
-    private HashSet<Transform> GetStableMatchedSet(HashSet<Transform> instantaneous)
-    {
-        temporalFrameCounter++;
-        // Update votes ring buffer
-        foreach (var kv in diagramPiecesByType)
-        {
-            foreach (Transform piece in kv.Value)
-            {
-                if (!votesByPiece.TryGetValue(piece, out var tv))
-                {
-                    tv = new TemporalVotes { buffer = new int[Mathf.Max(1, temporalWindowSize)], index = 0, count = 0 };
-                    votesByPiece[piece] = tv;
-                }
-                if (tv.buffer.Length != temporalWindowSize)
-                {
-                    tv.buffer = new int[Mathf.Max(1, temporalWindowSize)];
-                    tv.index = 0; tv.count = 0;
-                }
-                // write vote
-                tv.buffer[tv.index] = instantaneous.Contains(piece) ? 1 : 0;
-                tv.index = (tv.index + 1) % tv.buffer.Length;
-                if (tv.count < tv.buffer.Length) tv.count++;
-            }
-        }
-
-        // Derive stable set
-        var stable = new HashSet<Transform>();
-        foreach (var kv in diagramPiecesByType)
-        {
-            foreach (Transform piece in kv.Value)
-            {
-                var tv = votesByPiece[piece];
-                int sum = 0; for (int i = 0; i < tv.count; i++) sum += tv.buffer[i];
-                // If temporalMinVotes > 0, require at least that many; else pick majority (> half)
-                int threshold = temporalMinVotes > 0 ? temporalMinVotes : Mathf.Max(1, tv.buffer.Length / 2 + 1);
-                if (sum >= threshold) stable.Add(piece);
-            }
-        }
-        return stable;
     }
 
     // ---------- Diagram Graph Construction ----------
