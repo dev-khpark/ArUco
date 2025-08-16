@@ -49,6 +49,10 @@ public class TangramMatcher : MonoBehaviour
     [Header("Diagram Graph Settings")]
     [Tooltip("Adjacency threshold. Create an edge if center distance <= (sizeA+sizeB)*this factor.")]
     public float diagramAdjacencyMaxNormalizedDistance = 3.0f;
+    [Tooltip("If true, build diagram graph edges by 2D mesh intersection on the diagram plane instead of distance thresholds.")]
+    public bool diagramEdgesUseMeshIntersection = true;
+    [Tooltip("When using mesh-intersection edges, do a fast Renderer.bounds.Intersects pre-check before polygon overlap test.")]
+    public bool useBoundsPrecheckForMeshEdges = true;
     [Tooltip("Maximum neighbor edges to keep per node (closest first). 0 = unlimited.")]
     public int diagramMaxNeighborsPerNode = 4;
     [Tooltip("Graph matching distance tolerance (meters).")]
@@ -418,6 +422,89 @@ public class TangramMatcher : MonoBehaviour
         return diagramEdgeSet.Contains(EdgeKey(i, j)) || diagramEdgeSet.Contains(EdgeKey(j, i));
     }
 
+    // ---------- Geometry helpers for mesh-intersection edges ----------
+    // Project each piece's mesh vertices onto the diagram plane and compute a convex hull in 2D.
+    private List<Vector2> GetProjectedConvexHull2D(Transform piece, Vector3 planeNormal, Vector3 axisU, Vector3 axisV)
+    {
+        var result = new List<Vector2>();
+        if (piece == null) return result;
+        var meshFilter = piece.GetComponent<MeshFilter>();
+        if (meshFilter == null || meshFilter.sharedMesh == null) return result;
+        var verts = meshFilter.sharedMesh.vertices;
+        if (verts == null || verts.Length == 0) return result;
+
+        // Collect projected points
+        var pts = new List<Vector2>(verts.Length);
+        for (int i = 0; i < verts.Length; i++)
+        {
+            Vector3 world = piece.TransformPoint(verts[i]);
+            Vector3 p = Vector3.ProjectOnPlane(world, planeNormal);
+            float u = Vector3.Dot(p, axisU);
+            float v = Vector3.Dot(p, axisV);
+            pts.Add(new Vector2(u, v));
+        }
+
+        // Compute convex hull (Monotone chain)
+        pts.Sort((a, b) => a.x == b.x ? a.y.CompareTo(b.y) : a.x.CompareTo(b.x));
+        var hull = new List<Vector2>();
+        // lower
+        for (int i = 0; i < pts.Count; i++)
+        {
+            while (hull.Count >= 2 && Cross(hull[hull.Count - 2], hull[hull.Count - 1], pts[i]) <= 0f) hull.RemoveAt(hull.Count - 1);
+            hull.Add(pts[i]);
+        }
+        // upper
+        int t = hull.Count + 1;
+        for (int i = pts.Count - 2; i >= 0; i--)
+        {
+            while (hull.Count >= t && Cross(hull[hull.Count - 2], hull[hull.Count - 1], pts[i]) <= 0f) hull.RemoveAt(hull.Count - 1);
+            hull.Add(pts[i]);
+        }
+        if (hull.Count > 1) hull.RemoveAt(hull.Count - 1);
+        return hull;
+    }
+
+    private float Cross(Vector2 a, Vector2 b, Vector2 c)
+    {
+        return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+    }
+
+    // Convex polygon intersection test in 2D using Separating Axis Theorem
+    private bool ConvexPolygonsIntersect(List<Vector2> hullA, List<Vector2> hullB)
+    {
+        if (hullA == null || hullB == null || hullA.Count < 3 || hullB.Count < 3) return false;
+        if (!OverlapOnAllAxes(hullA, hullB)) return false;
+        if (!OverlapOnAllAxes(hullB, hullA)) return false;
+        return true;
+    }
+
+    private bool OverlapOnAllAxes(List<Vector2> polyA, List<Vector2> polyB)
+    {
+        for (int i = 0; i < polyA.Count; i++)
+        {
+            Vector2 p1 = polyA[i];
+            Vector2 p2 = polyA[(i + 1) % polyA.Count];
+            Vector2 edge = p2 - p1;
+            Vector2 axis = new Vector2(-edge.y, edge.x).normalized;
+            ProjectPolygon(polyA, axis, out float minA, out float maxA);
+            ProjectPolygon(polyB, axis, out float minB, out float maxB);
+            if (maxA < minB || maxB < minA) return false;
+        }
+        return true;
+    }
+
+    private void ProjectPolygon(List<Vector2> poly, Vector2 axis, out float min, out float max)
+    {
+        float d = Vector2.Dot(poly[0], axis);
+        min = d; max = d;
+        for (int i = 1; i < poly.Count; i++)
+        {
+            d = Vector2.Dot(poly[i], axis);
+            if (d < min) min = d;
+            else if (d > max) max = d;
+        }
+    }
+
     // Stateful matching data
     private int frameCounter = 0;
     private class LockedState
@@ -448,6 +535,7 @@ public class TangramMatcher : MonoBehaviour
     private float cachedBaselineExpRef = 1f;
     private int cachedBaselineFrame = -1;
     private bool cachedBaselineValid = false;
+    private readonly HashSet<string> previousDetectionKeySet = new HashSet<string>();
 
     void Awake()
     {
@@ -616,6 +704,7 @@ public class TangramMatcher : MonoBehaviour
                     latestDetections[i] = d;
                 }
             }
+            InvalidateBaselinesIfNewDetectionsPresent();
         }
 
         frameCounter++;
@@ -809,6 +898,7 @@ public class TangramMatcher : MonoBehaviour
                     latestDetections[i] = d;
                 }
             }
+            InvalidateBaselinesIfNewDetectionsPresent();
         }
 
         RunMatchingAndHighlight();
@@ -1178,47 +1268,99 @@ public class TangramMatcher : MonoBehaviour
             diagramGraph.nodes.Add(node);
         }
 
-        // Build edges using normalized distance threshold and direction angle
+        // Build edges
         for (int i = 0; i < diagramGraph.nodes.Count; i++)
         {
             var ni = diagramGraph.nodes[i];
             Vector3 pi = GetPieceCenterWorld(ni.piece);
+            var allEdges = new List<DiagramGraph.Edge>();
+
+            bool usingOverlapEdges = diagramEdgesUseMeshIntersection;
+
+            // Precompute plane basis for 2D projection once
+            Vector3 planeN = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
+            Vector3 axisU = Vector3.Cross(planeN, Vector3.up);
+            if (axisU.sqrMagnitude < 1e-6f) axisU = Vector3.Cross(planeN, Vector3.right);
+            axisU.Normalize();
+            Vector3 axisV = Vector3.Cross(planeN, axisU);
+
+            // Cache convex hulls for all nodes
+            var hullCache = new Dictionary<int, List<Vector2>>();
+            for (int h = 0; h < diagramGraph.nodes.Count; h++)
+            {
+                hullCache[h] = GetProjectedConvexHull2D(diagramGraph.nodes[h].piece, planeN, axisU, axisV);
+            }
+
+            // Build edges either by mesh overlap on plane or legacy distance threshold
             int bestJ = -1;
             float bestDist = float.PositiveInfinity;
             float bestNorm = float.PositiveInfinity;
             float bestAngle = 0f;
-            var allEdges = new List<DiagramGraph.Edge>();
             for (int j = 0; j < diagramGraph.nodes.Count; j++)
             {
                 if (i == j) continue;
                 var nj = diagramGraph.nodes[j];
                 Vector3 pj = GetPieceCenterWorld(nj.piece);
 
-                float centerDist = Vector3.Distance(pi, pj);
-                float norm = (ni.sizeMeters + nj.sizeMeters);
-                float normalized = norm > 1e-4f ? centerDist / norm : float.PositiveInfinity;
-                if (normalized <= diagramAdjacencyMaxNormalizedDistance)
+                bool connect = false;
+                float normalized = float.PositiveInfinity;
+                if (usingOverlapEdges)
                 {
+                    // Optional fast 3D bounds precheck
+                    if (useBoundsPrecheckForMeshEdges)
+                    {
+                        var ri = ni.piece.GetComponent<MeshRenderer>();
+                        var rj = nj.piece.GetComponent<MeshRenderer>();
+                        if (ri != null && rj != null && !ri.bounds.Intersects(rj.bounds))
+                        {
+                            connect = false;
+                        }
+                        else
+                        {
+                            connect = ConvexPolygonsIntersect(hullCache[i], hullCache[j]);
+                        }
+                    }
+                    else
+                    {
+                        connect = ConvexPolygonsIntersect(hullCache[i], hullCache[j]);
+                    }
+                }
+                else
+                {
+                    float centerDist = Vector3.Distance(pi, pj);
+                    float norm = (ni.sizeMeters + nj.sizeMeters);
+                    normalized = norm > 1e-4f ? centerDist / norm : float.PositiveInfinity;
+                    connect = (normalized <= diagramAdjacencyMaxNormalizedDistance);
+                }
+
+                if (connect)
+                {
+                    float centerDist = Vector3.Distance(pi, pj);
                     float angle = ComputePlanarAngleDeg(pi, pj);
                     var edge = new DiagramGraph.Edge
                     {
                         toIndex = diagramGraph.indexByTransform[nj.piece],
                         expectedDistanceMeters = centerDist,
                         expectedAngleDeg = angle,
-                        normalizedDistance = normalized
+                        normalizedDistance = (ni.sizeMeters + nj.sizeMeters) > 1e-4f ? centerDist / (ni.sizeMeters + nj.sizeMeters) : 0f
                     };
                     allEdges.Add(edge);
-                    if (centerDist < bestDist)
+
+                    if (!usingOverlapEdges)
                     {
-                        bestDist = centerDist;
-                        bestJ = j;
-                        bestNorm = normalized;
-                        bestAngle = angle;
+                        if (centerDist < bestDist)
+                        {
+                            bestDist = centerDist;
+                            bestJ = j;
+                            bestNorm = edge.normalizedDistance;
+                            bestAngle = angle;
+                        }
                     }
                 }
             }
 
-            if (diagramOnlyNearestNeighbor)
+            // If using mesh-overlap edges, ignore nearest-neighbor pruning and keep all intersecting edges
+            if (diagramOnlyNearestNeighbor && !usingOverlapEdges)
             {
                 if (bestJ >= 0)
                 {
@@ -1235,11 +1377,14 @@ public class TangramMatcher : MonoBehaviour
             else
             {
                 ni.edges.AddRange(allEdges);
-                // Keep only closest edges if limited
-                if (diagramMaxNeighborsPerNode > 0 && ni.edges.Count > diagramMaxNeighborsPerNode)
+                // If using mesh-overlap edges, keep all intersecting connections as requested (do not trim)
+                if (!usingOverlapEdges)
                 {
-                    ni.edges.Sort((a, b) => a.expectedDistanceMeters.CompareTo(b.expectedDistanceMeters));
-                    ni.edges.RemoveRange(diagramMaxNeighborsPerNode, ni.edges.Count - diagramMaxNeighborsPerNode);
+                    if (diagramMaxNeighborsPerNode > 0 && ni.edges.Count > diagramMaxNeighborsPerNode)
+                    {
+                        ni.edges.Sort((a, b) => a.expectedDistanceMeters.CompareTo(b.expectedDistanceMeters));
+                        ni.edges.RemoveRange(diagramMaxNeighborsPerNode, ni.edges.Count - diagramMaxNeighborsPerNode);
+                    }
                 }
             }
         }
@@ -1627,103 +1772,98 @@ public class TangramMatcher : MonoBehaviour
             }
             else
             {
-                // Relational cost using only the nearest already-matched neighbor
+                // Relational cost using the BEST (lowest-cost) relation among matched neighbors that are connected in the diagram graph
                 var nearMissList = new List<(Transform p, float avgDistDiff, float avgAngDiff, float cost)>();
                 foreach (var p in filteredCandidates)
                 {
-                    // find nearest matched neighbor in detection graph
-                    int nearestIdx = -1; float nearestDet = float.PositiveInfinity; Transform nearestPiece = null;
+                    float bestLocalCost = float.PositiveInfinity;
+                    float bestLocalDist = 0f;
+                    float bestLocalAng = 0f;
+                    bool hadRelation = false;
+
                     foreach (int nIdx in node.neighbors)
                     {
                         if (!detToPiece.TryGetValue(nIdx, out var np)) continue;
-                        float d = Vector3.Distance(dg.nodes[nIdx].pos, node.pos);
-                        if (d < nearestDet) { nearestDet = d; nearestIdx = nIdx; nearestPiece = np; }
-                    }
-                    if (nearestIdx < 0) continue; // no neighbor constraints available
-                    if (restrictRelationsToGraphEdges)
-                    {
-                        if (!diagramGraph.indexByTransform.TryGetValue(p, out int ip)) continue;
-                        if (!diagramGraph.indexByTransform.TryGetValue(nearestPiece, out int inb)) continue;
-                        if (!IsDiagramEdge(ip, inb)) continue; // enforce diagram adjacency
-                    }
-
-                    Vector3 vDet = dg.nodes[nearestIdx].pos - node.pos;
-                    Vector3 vDiag = GetPieceCenterWorld(nearestPiece) - GetPieceCenterWorld(p);
-                    if (usePlanarProjectionForRelations)
-                    {
-                        Vector3 nrm = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
-                        vDet = Vector3.ProjectOnPlane(vDet, nrm);
-                        vDiag = Vector3.ProjectOnPlane(vDiag, nrm);
-                    }
-                    float scaleFactor = 1f;
-                    if (useScaleNormalization && vDiag.magnitude > 1e-4f)
-                        scaleFactor = vDet.magnitude / vDiag.magnitude;
-                    // Project to diagram plane for stable relation comparison
-                    Vector3 planeN = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
-                    Vector3 vDetP = Vector3.ProjectOnPlane(vDet, planeN);
-                    Vector3 vDiagP = Vector3.ProjectOnPlane(vDiag, planeN);
-                    float avgDistDiff = Mathf.Abs(vDetP.magnitude - vDiagP.magnitude * scaleFactor);
-                    if (useNormalizedRelationDistance)
-                    {
-                        if (useSubsetUnifiedBaseline)
+                        if (restrictRelationsToGraphEdges)
                         {
-                            if (cachedBaselineValid)
+                            if (!diagramGraph.indexByTransform.TryGetValue(p, out int ip)) continue;
+                            if (!diagramGraph.indexByTransform.TryGetValue(np, out int inb)) continue;
+                            if (!IsDiagramEdge(ip, inb)) continue;
+                        }
+
+                        hadRelation = true;
+
+                        Vector3 vDet = dg.nodes[nIdx].pos - node.pos;
+                        Vector3 vDiag = GetPieceCenterWorld(np) - GetPieceCenterWorld(p);
+                        if (usePlanarProjectionForRelations)
+                        {
+                            Vector3 nrm = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
+                            vDet = Vector3.ProjectOnPlane(vDet, nrm);
+                            vDiag = Vector3.ProjectOnPlane(vDiag, nrm);
+                        }
+                        float scaleFactor = 1f;
+                        if (useScaleNormalization && vDiag.magnitude > 1e-4f)
+                            scaleFactor = vDet.magnitude / vDiag.magnitude;
+
+                        Vector3 planeN = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
+                        Vector3 vDetP = Vector3.ProjectOnPlane(vDet, planeN);
+                        Vector3 vDiagP = Vector3.ProjectOnPlane(vDiag, planeN);
+                        float distDiff = Mathf.Abs(vDetP.magnitude - vDiagP.magnitude * scaleFactor);
+                        if (useNormalizedRelationDistance)
+                        {
+                            if (useSubsetUnifiedBaseline)
                             {
-                                float ratioDet = vDetP.magnitude / Mathf.Max(1e-4f, cachedBaselineDetRef);
-                                float ratioDiag = (vDiagP.magnitude * scaleFactor) / Mathf.Max(1e-4f, cachedBaselineExpRef);
-                                avgDistDiff = Mathf.Abs(ratioDet - ratioDiag);
+                                if (cachedBaselineValid)
+                                {
+                                    float ratioDet = vDetP.magnitude / Mathf.Max(1e-4f, cachedBaselineDetRef);
+                                    float ratioDiag = (vDiagP.magnitude * scaleFactor) / Mathf.Max(1e-4f, cachedBaselineExpRef);
+                                    distDiff = Mathf.Abs(ratioDet - ratioDiag);
+                                }
+                                else
+                                {
+                                    float detRef, expRef;
+                                    if (!TryGetSubsetReferenceBaselines(dg, detToPiece, out detRef, out expRef))
+                                    {
+                                        detRef = Mathf.Max(1e-4f, GetCurrentMatchedSubsetMaxDetectionEdgeDistance(dg, detToPiece));
+                                        expRef = Mathf.Max(1e-4f, GetCurrentMatchedSubsetMaxDiagramEdgeExpected(detToPiece));
+                                    }
+                                    float ratioDet = vDetP.magnitude / Mathf.Max(1e-4f, detRef);
+                                    float ratioDiag = (vDiagP.magnitude * scaleFactor) / Mathf.Max(1e-4f, expRef);
+                                    distDiff = Mathf.Abs(ratioDet - ratioDiag);
+                                }
                             }
                             else
                             {
-                                float detRef, expRef;
-                                if (!TryGetSubsetReferenceBaselines(dg, detToPiece, out detRef, out expRef))
+                                float baseline = Vector3.Distance(GetPieceCenterWorld(np), GetPieceCenterWorld(p));
+                                if (baseline > 1e-4f)
                                 {
-                                    detRef = Mathf.Max(1e-4f, GetCurrentMatchedSubsetMaxDetectionEdgeDistance(dg, detToPiece));
-                                    expRef = Mathf.Max(1e-4f, GetCurrentMatchedSubsetMaxDiagramEdgeExpected(detToPiece));
+                                    float ratioDet = vDetP.magnitude / baseline;
+                                    float ratioDiag = (vDiagP.magnitude * scaleFactor) / baseline;
+                                    distDiff = Mathf.Abs(ratioDet - ratioDiag);
                                 }
-                                float ratioDet = vDetP.magnitude / Mathf.Max(1e-4f, detRef);
-                                float ratioDiag = (vDiagP.magnitude * scaleFactor) / Mathf.Max(1e-4f, expRef);
-                                avgDistDiff = Mathf.Abs(ratioDet - ratioDiag);
                             }
                         }
-                        else
+                        float angDiff = Mathf.Abs(Mathf.DeltaAngle(0f, Vector3.SignedAngle(vDetP.normalized, vDiagP.normalized, planeN)));
+
+                        float cost = distDiff + rotationWeightMetersPerDeg * angDiff;
+                        if (useAbsoluteDistanceInCost)
                         {
-                            float baseline = Vector3.Distance(GetPieceCenterWorld(nearestPiece), GetPieceCenterWorld(p));
-                            if (baseline > 1e-4f)
-                            {
-                                float ratioDet = vDetP.magnitude / baseline;
-                                float ratioDiag = (vDiagP.magnitude * scaleFactor) / baseline;
-                                avgDistDiff = Mathf.Abs(ratioDet - ratioDiag);
-                            }
+                            var detAbs = latestDetections[node.detIndex];
+                            float absDist0 = Vector3.Distance(detAbs.worldPosition, GetPieceCenterWorld(p));
+                            cost += absoluteDistanceWeightMeters * absDist0;
+                        }
+
+                        if (cost < bestLocalCost)
+                        {
+                            bestLocalCost = cost;
+                            bestLocalDist = distDiff;
+                            bestLocalAng = angDiff;
                         }
                     }
-                    float avgAngDiff = Mathf.Abs(Mathf.DeltaAngle(0f, Vector3.SignedAngle(vDetP.normalized, vDiagP.normalized, planeN)));
-                    if (avgDistDiff > relationMaxDistDiff || avgAngDiff > relationMaxAngleDiffDeg)
-                    {
-                        if (verboseRelationDebug)
-                        {
-                            nearMissList.Add((p, avgDistDiff, avgAngDiff, avgDistDiff + rotationWeightMetersPerDeg * avgAngDiff));
-                        }
-                        continue;
-                    }
-                    // Base relational cost from distance and relative-angle diff
-                    float cost = avgDistDiff + rotationWeightMetersPerDeg * avgAngDiff;
-                    if (useAbsoluteDistanceInCost)
-                    {
-                        var detAbs = latestDetections[node.detIndex];
-                        float absDist0 = Vector3.Distance(detAbs.worldPosition, GetPieceCenterWorld(p));
-                        cost += absoluteDistanceWeightMeters * absDist0;
-                    }
 
-                    // Add absolute detection-to-piece center distance
-                    if (useAbsoluteDistanceInCost)
-                    {
-                        var detAbs = latestDetections[node.detIndex];
-                        float absDist0 = Vector3.Distance(detAbs.worldPosition, GetPieceCenterWorld(p));
-                        cost += absoluteDistanceWeightMeters * absDist0;
-                    }
+                    if (!hadRelation) continue;
 
-                    // Optional absolute orientation gating/cost using piece 'direction' child vs detection +X
+                    // Absolute orientation preference/gating once per candidate
                     if (useAbsoluteOrientation)
                     {
                         var det = latestDetections[node.detIndex];
@@ -1734,7 +1874,6 @@ public class TangramMatcher : MonoBehaviour
                         {
                             float absOriDeg = Mathf.Abs(Vector3.SignedAngle(pieceDir, detDir, planeNCand));
                             absOriDeg = NormalizeAngle180(absOriDeg);
-                            // Apply symmetry for type if helpful
                             float mod = GetSymmetryModuloDegrees(node.type);
                             if (mod > 0f)
                             {
@@ -1743,7 +1882,6 @@ public class TangramMatcher : MonoBehaviour
                             }
                             if (absOriDeg > absoluteOrientationToleranceDeg)
                             {
-                                // Reject candidate if outside tolerance
                                 if (debugLogOrientationRejections)
                                 {
                                     Debug.Log($"[TangramMatcher] ORI REJECT det({node.type}:{latestDetections[node.detIndex].arucoId}) -> diag({p.name}) | absOri={absOriDeg:F1}° > tol={absoluteOrientationToleranceDeg:F1}°");
@@ -1754,46 +1892,46 @@ public class TangramMatcher : MonoBehaviour
                             {
                                 Debug.Log($"[TangramMatcher] ORI diff det({node.type}:{latestDetections[node.detIndex].arucoId}) -> diag({p.name}) | absOri={absOriDeg:F1}°");
                             }
-                            cost += absoluteOrientationWeightMetersPerDeg * absOriDeg;
+                            bestLocalCost += absoluteOrientationWeightMetersPerDeg * absOriDeg;
                         }
                     }
+
                     if (preferPreviousAssignment)
                     {
                         var key = (node.type, latestDetections[node.detIndex].arucoId);
                         if (lastAssignedPieceByKey.TryGetValue(key, out var prev) && prev == p)
                         {
-                            cost = Mathf.Max(0f, cost - previousAssignmentBiasMeters);
+                            bestLocalCost = Mathf.Max(0f, bestLocalCost - previousAssignmentBiasMeters);
                         }
                         else if (lastAssignedPieceByKey.TryGetValue(key, out var prevPiece) && prevPiece != null)
                         {
                             if (lockedByPiece.TryGetValue(prevPiece, out var ls) && frameCounter - ls.lastSeenFrame <= assignmentCooldownFrames)
                             {
-                                cost += cooldownPenaltyMeters;
+                                bestLocalCost += cooldownPenaltyMeters;
                             }
                         }
                     }
-                    bool passes = avgDistDiff <= graphDistanceToleranceMeters && avgAngDiff <= graphAngleToleranceDeg;
+
+                    bool passes = bestLocalDist <= graphDistanceToleranceMeters && bestLocalAng <= graphAngleToleranceDeg;
                     if (passes)
                     {
-                        if (cost < chosenCost)
+                        if (bestLocalCost < chosenCost)
                         {
-                            chosenCost = cost;
+                            chosenCost = bestLocalCost;
                             chosen = p;
-                            chosenAvgDistDiff = avgDistDiff;
-                            chosenAvgAngDiff = avgAngDiff;
+                            chosenAvgDistDiff = bestLocalDist;
+                            chosenAvgAngDiff = bestLocalAng;
                         }
                     }
                     else
                     {
-                        nearMissList.Add((p, avgDistDiff, avgAngDiff, cost));
+                        nearMissList.Add((p, bestLocalDist, bestLocalAng, bestLocalCost));
                         if (debugDrawNearMissLines)
                         {
-                            // draw a line from this detection to the candidate to visualize near miss
-                            linkSegments.Add((node.pos, p.position, avgDistDiff, p, node.type, latestDetections[node.detIndex].arucoId));
+                            linkSegments.Add((node.pos, p.position, bestLocalDist, p, node.type, latestDetections[node.detIndex].arucoId));
                         }
                     }
                 }
-                // Log top near-miss candidates
                 if (debugLogUnmatchedCandidates && nearMissList.Count > 0)
                 {
                     nearMissList.Sort((a, b) => a.cost.CompareTo(b.cost));
@@ -1802,11 +1940,6 @@ public class TangramMatcher : MonoBehaviour
                     {
                         var nm = nearMissList[ii];
                         Debug.Log($"[TangramMatcher] near-miss for det({node.type}) -> diag({nm.p.name}) avg diff(d)={nm.avgDistDiff:F3}m avg diff(deg)={nm.avgAngDiff:F1} deg | tol(d)<={graphDistanceToleranceMeters:F3} tol(deg)<={graphAngleToleranceDeg:F1}");
-                        if (debugDrawNearMissLines)
-                        {
-                            // Draw line from detection to candidate piece center with near-miss color and use distance diff for segment magnitude coloring elsewhere if needed
-                            // We'll add a short segment into the shared near-miss collector via link-like callback by referencing outer scope list
-                        }
                     }
                 }
             }
@@ -2159,12 +2292,24 @@ AUGMENT:
     private bool TryComputeRelationalCostForCandidate(int nodeIdx, Transform candidatePiece, DetectionGraph dg, Dictionary<int, Transform> detToPiece,
         out float avgDistDiff, out float avgAngDiff, out float usedScale, out int usedCount)
     {
-        float sumDist = 0f, sumAng = 0f; int count = 0; usedScale = 1f;
-        var scaleSamples = new List<float>();
+        // Compute the BEST (lowest cost) relation among all matched neighbors that are connected in the diagram graph
+        avgDistDiff = 0f; avgAngDiff = 0f; usedScale = 1f; usedCount = 0;
         var center = dg.nodes[nodeIdx];
-        foreach (int nIdx in center.neighbors)
+        float bestCost = float.PositiveInfinity;
+        float bestDist = 0f, bestAng = 0f, bestScale = 1f;
+
+        for (int nn = 0; nn < center.neighbors.Count; nn++)
         {
+            int nIdx = center.neighbors[nn];
             if (!detToPiece.TryGetValue(nIdx, out var neighborPiece)) continue;
+
+            if (restrictRelationsToGraphEdges)
+            {
+                if (!diagramGraph.indexByTransform.TryGetValue(candidatePiece, out int ip)) continue;
+                if (!diagramGraph.indexByTransform.TryGetValue(neighborPiece, out int inb)) continue;
+                if (!IsDiagramEdge(ip, inb)) continue;
+            }
+
             Vector3 vDet = dg.nodes[nIdx].pos - center.pos;
             Vector3 vDiag = GetPieceCenterWorld(neighborPiece) - GetPieceCenterWorld(candidatePiece);
             if (usePlanarProjectionForRelations)
@@ -2173,35 +2318,62 @@ AUGMENT:
                 vDet = Vector3.ProjectOnPlane(vDet, nrm);
                 vDiag = Vector3.ProjectOnPlane(vDiag, nrm);
             }
-            sumDist += Mathf.Abs(vDet.magnitude - vDiag.magnitude);
-            sumAng += ComputePlanarAngleBetweenVectors(vDet, vDiag);
+
+            float localScale = 1f;
             if (useScaleNormalization && vDiag.magnitude > 1e-4f)
-                scaleSamples.Add(vDet.magnitude / vDiag.magnitude);
-            count++;
-        }
-        if (count == 0) { avgDistDiff = 0f; avgAngDiff = 0f; usedCount = 0; return false; }
-        if (useScaleNormalization && scaleSamples.Count > 0)
-        {
-            scaleSamples.Sort(); usedScale = scaleSamples[scaleSamples.Count / 2];
-            // recompute distance diff with scale
-            sumDist = 0f; int rc = 0;
-            foreach (int nIdx in center.neighbors)
+                localScale = vDet.magnitude / vDiag.magnitude;
+
+            // Optionally normalize distance by unified baseline
+            float distDiff;
+            if (useNormalizedRelationDistance)
             {
-                if (!detToPiece.TryGetValue(nIdx, out var neighborPiece)) continue;
-                Vector3 vDet = dg.nodes[nIdx].pos - center.pos;
-                Vector3 vDiag = GetPieceCenterWorld(neighborPiece) - GetPieceCenterWorld(candidatePiece);
-                if (usePlanarProjectionForRelations)
+                float ratioDet, ratioDiag;
+                if (useSubsetUnifiedBaseline)
                 {
-                    Vector3 nrm = tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up;
-                    vDet = Vector3.ProjectOnPlane(vDet, nrm);
-                    vDiag = Vector3.ProjectOnPlane(vDiag, nrm);
+                    float detRef, expRef;
+                    if (!TryGetSubsetReferenceBaselines(dg, detToPiece, out detRef, out expRef))
+                    {
+                        detRef = Mathf.Max(1e-4f, GetCurrentMatchedSubsetMaxDetectionEdgeDistance(dg, detToPiece));
+                        expRef = Mathf.Max(1e-4f, GetCurrentMatchedSubsetMaxDiagramEdgeExpected(detToPiece));
+                    }
+                    ratioDet = vDet.magnitude / Mathf.Max(1e-4f, detRef);
+                    ratioDiag = (vDiag.magnitude * localScale) / Mathf.Max(1e-4f, expRef);
                 }
-                sumDist += Mathf.Abs(vDet.magnitude - vDiag.magnitude * usedScale);
-                rc++;
+                else
+                {
+                    float baseline = Vector3.Distance(GetPieceCenterWorld(neighborPiece), GetPieceCenterWorld(candidatePiece));
+                    ratioDet = vDet.magnitude / Mathf.Max(1e-4f, baseline);
+                    ratioDiag = (vDiag.magnitude * localScale) / Mathf.Max(1e-4f, baseline);
+                }
+                distDiff = Mathf.Abs(ratioDet - ratioDiag);
             }
-            if (rc > 0) count = rc;
+            else
+            {
+                distDiff = Mathf.Abs(vDet.magnitude - vDiag.magnitude * localScale);
+            }
+
+            float angDiff = ComputePlanarAngleBetweenVectors(vDet, vDiag);
+            float cost = distDiff + rotationWeightMetersPerDeg * angDiff;
+
+            if (useAbsoluteDistanceInCost)
+            {
+                var detAbs = latestDetections[center.detIndex];
+                float absDist0 = Vector3.Distance(detAbs.worldPosition, GetPieceCenterWorld(candidatePiece));
+                cost += absoluteDistanceWeightMeters * absDist0;
+            }
+
+            if (cost < bestCost)
+            {
+                bestCost = cost;
+                bestDist = distDiff;
+                bestAng = angDiff;
+                bestScale = localScale;
+                usedCount = 1;
+            }
         }
-        avgDistDiff = sumDist / count; avgAngDiff = sumAng / count; usedCount = count; return true;
+
+        if (float.IsPositiveInfinity(bestCost)) return false;
+        avgDistDiff = bestDist; avgAngDiff = bestAng; usedScale = bestScale; return true;
     }
 
     private float EstimatePieceSizeMeters(Transform piece)
@@ -3450,6 +3622,36 @@ AUGMENT:
             cachedBaselineValid = true;
         }
         // else: keep previous cached values
+    }
+
+    // Reset cached normalization baselines if a new non-corner detection appeared this frame
+    private void InvalidateBaselinesIfNewDetectionsPresent()
+    {
+        try
+        {
+            var current = new HashSet<string>();
+            for (int i = 0; i < latestDetections.Count; i++)
+            {
+                var d = latestDetections[i];
+                if (d.isCorner) continue;
+                current.Add($"{d.shapeType}:{d.arucoId}");
+            }
+            bool hasNew = false;
+            foreach (var key in current)
+            {
+                if (!previousDetectionKeySet.Contains(key)) { hasNew = true; break; }
+            }
+            // update snapshot for next frame
+            previousDetectionKeySet.Clear();
+            foreach (var k in current) previousDetectionKeySet.Add(k);
+
+            if (hasNew)
+            {
+                cachedBaselineValid = false;
+                cachedBaselineFrame = -1;
+            }
+        }
+        catch { /* defensive: do nothing on exceptions */ }
     }
 }
 
