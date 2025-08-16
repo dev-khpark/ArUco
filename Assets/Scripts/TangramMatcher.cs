@@ -2918,8 +2918,8 @@ AUGMENT:
         if (detectionWorldRotation == Quaternion.identity)
             return 0f;
 
-        // Use diagram up as plane normal; fallback to world up
-        Vector3 planeNormal = tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up;
+        // Use the same plane normal policy as elsewhere
+        Vector3 planeNormal = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
 
         // Compute detection direction: by convention use local +X of the ArUco marker
         Vector3 detDir = detectionWorldRotation * Vector3.right;
@@ -3285,10 +3285,15 @@ AUGMENT:
                 float dExp = Vector3.Distance(GetPieceCenterWorld(pA), GetPieceCenterWorld(pB));
                 float aExp = ComputePlanarAngleDeg(GetPieceCenterWorld(pA), GetPieceCenterWorld(pB));
                 float aDiff = Mathf.Abs(NormalizeAngle180(aDeg - aExp));
+                // Orientation error per-shape (detection vs matched piece)
+                float oriA = (pA != null) ? ComputeAngleError(A.shapeType, A.worldRotation, pA) : 0f;
+                float oriB = (pB != null) ? ComputeAngleError(B.shapeType, B.worldRotation, pB) : 0f;
                 if (angleOnlyForTwoDetections)
                 {
                     bool passAngle = aDiff <= relationMaxAngleDiffDeg;
-                    relLogQueue.Add($"[TangramMatcher] REL det({A.shapeType}:{A.arucoId})->det({B.shapeType}:{B.arucoId}) | (distance ignored: 2-detection) | deg={aDeg:F1} exp={aExp:F1} Δθ={aDiff:F1} (tol {relationMaxAngleDiffDeg:F1}) | {(passAngle ? "PASS" : "FAIL")}");
+                    bool passOri = !useAbsoluteOrientation || (oriA <= absoluteOrientationToleranceDeg && oriB <= absoluteOrientationToleranceDeg);
+                    bool pass = passAngle && passOri;
+                    relLogQueue.Add($"[TangramMatcher] REL det({A.shapeType}:{A.arucoId})->det({B.shapeType}:{B.arucoId}) | (distance ignored: 2-detection) | deg={aDeg:F1} exp={aExp:F1} Δθ={aDiff:F1} (tol {relationMaxAngleDiffDeg:F1}) | ORI_A={oriA:F1}° ORI_B={oriB:F1}° (tol {absoluteOrientationToleranceDeg:F1}) | {(pass ? "PASS" : "FAIL")}");
                 }
                 else
                 {
@@ -3322,14 +3327,20 @@ AUGMENT:
                             rExp = dExp / baseline;
                         }
                         dDiff = Mathf.Abs(rAct - rExp);
-                        bool pass = dDiff <= relationMaxDistDiff && aDiff <= relationMaxAngleDiffDeg;
-                        relLogQueue.Add($"[TangramMatcher] REL det({A.shapeType}:{A.arucoId})->det({B.shapeType}:{B.arucoId}) | r={rAct:F3} expR={rExp:F3} Δr={dDiff:F3} (tol {relationMaxDistDiff:F3}) | deg={aDeg:F1} exp={aExp:F1} Δθ={aDiff:F1} (tol {relationMaxAngleDiffDeg:F1}) | {(pass ? "PASS" : "FAIL")}");
+                        bool passDist = dDiff <= relationMaxDistDiff;
+                        bool passAng = aDiff <= relationMaxAngleDiffDeg;
+                        bool passOri = !useAbsoluteOrientation || (oriA <= absoluteOrientationToleranceDeg && oriB <= absoluteOrientationToleranceDeg);
+                        bool pass = passDist && passAng && passOri;
+                        relLogQueue.Add($"[TangramMatcher] REL det({A.shapeType}:{A.arucoId})->det({B.shapeType}:{B.arucoId}) | r={rAct:F3} expR={rExp:F3} Δr={dDiff:F3} (tol {relationMaxDistDiff:F3}) | deg={aDeg:F1} exp={aExp:F1} Δθ={aDiff:F1} (tol {relationMaxAngleDiffDeg:F1}) | ORI_A={oriA:F1}° ORI_B={oriB:F1}° (tol {absoluteOrientationToleranceDeg:F1}) | {(pass ? "PASS" : "FAIL")}");
                     }
                     else
                     {
                         dDiff = Mathf.Abs(dActual - dExp);
-                bool pass = dDiff <= relationMaxDistDiff && aDiff <= relationMaxAngleDiffDeg;
-                relLogQueue.Add($"[TangramMatcher] REL det({A.shapeType}:{A.arucoId})->det({B.shapeType}:{B.arucoId}) | d={dActual:F3}m exp={dExp:F3}m Δd={dDiff:F3} (tol {relationMaxDistDiff:F3}) | deg={aDeg:F1} exp={aExp:F1} Δθ={aDiff:F1} (tol {relationMaxAngleDiffDeg:F1}) | {(pass ? "PASS" : "FAIL")}");
+                        bool passDist = dDiff <= relationMaxDistDiff;
+                        bool passAng = aDiff <= relationMaxAngleDiffDeg;
+                        bool passOri = !useAbsoluteOrientation || (oriA <= absoluteOrientationToleranceDeg && oriB <= absoluteOrientationToleranceDeg);
+                        bool pass = passDist && passAng && passOri;
+                        relLogQueue.Add($"[TangramMatcher] REL det({A.shapeType}:{A.arucoId})->det({B.shapeType}:{B.arucoId}) | d={dActual:F3}m exp={dExp:F3}m Δd={dDiff:F3} (tol {relationMaxDistDiff:F3}) | deg={aDeg:F1} exp={aExp:F1} Δθ={aDiff:F1} (tol {relationMaxAngleDiffDeg:F1}) | ORI_A={oriA:F1}° ORI_B={oriB:F1}° (tol {absoluteOrientationToleranceDeg:F1}) | {(pass ? "PASS" : "FAIL")}");
                     }
                 }
             }
@@ -3337,7 +3348,10 @@ AUGMENT:
             {
                 if (!suppressNoExpectedRelationLogs)
                 {
-                    relLogQueue.Add($"[TangramMatcher] REL det({A.shapeType}:{A.arucoId})->det({B.shapeType}:{B.arucoId}) | d={dActual:F3}m | deg={aDeg:F1} | (no expected)");
+                    // Even if no expected relation, report ORI per shape for debugging
+                    float oriA = (pA != null) ? ComputeAngleError(A.shapeType, A.worldRotation, pA) : 0f;
+                    float oriB = (pB != null) ? ComputeAngleError(B.shapeType, B.worldRotation, pB) : 0f;
+                    relLogQueue.Add($"[TangramMatcher] REL det({A.shapeType}:{A.arucoId})->det({B.shapeType}:{B.arucoId}) | d={dActual:F3}m | deg={aDeg:F1} | ORI_A={oriA:F1}° ORI_B={oriB:F1}° | (no expected)");
                 }
             }
             if (drawLines)
