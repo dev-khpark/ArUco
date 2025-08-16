@@ -31,8 +31,20 @@ public class TangramMatcher : MonoBehaviour
     [Tooltip("Maximum planar angle error (degrees) allowed for a match.")]
     public float maxAngleErrorDegrees = 45f;
     [Tooltip("Weight converting rotation error (degrees) into meters for matching cost. cost = distance(m) + rotationWeightMetersPerDeg * angle(deg)")]
-    public float rotationWeightMetersPerDeg = 0.005f;
+    public float rotationWeightMetersPerDeg = 0.01f;
     // Anchor-relative matching removed
+
+    [Header("Distance Cost Model")]
+    [Tooltip("Include absolute detection-to-piece center distance in candidate cost (uses world meters).")]
+    public bool useAbsoluteDistanceInCost = false;
+    [Tooltip("Weight for absolute distance contribution (meters -> meters). Only used when useAbsoluteDistanceInCost is true.")]
+    public float absoluteDistanceWeightMeters = 1.0f;
+    [Tooltip("Use normalized relation distance ratios instead of raw meter differences. Ratios are computed relative to a baseline.")]
+    public bool useNormalizedRelationDistance = true;
+    [Tooltip("Weight converting pairwise center-angle error (degrees) into meters for two-detection fallback and general costs.")]
+    public float pairwiseAngleWeightMetersPerDeg = 0.01f;
+    [Tooltip("If true, use a unified baseline within the currently matched subset (max diagram distance among matched pieces) for ratio normalization.")]
+    public bool useSubsetUnifiedBaseline = true;
 
     [Header("Diagram Graph Settings")]
     [Tooltip("Adjacency threshold. Create an edge if center distance <= (sizeA+sizeB)*this factor.")]
@@ -82,6 +94,17 @@ public class TangramMatcher : MonoBehaviour
     public bool debugDrawErrorLines = true;
     [Tooltip("Overlay per-match error text (distance and angle) on screen at piece position.")]
     public bool showErrorLabelsUI = false;
+    [Tooltip("Overlay per-detection ArUco Euler angles (XYZ in degrees) near each detected marker.")]
+    public bool showDetectionEulerUI = true;
+    [Header("Detection Orientation Debug")]
+    [Tooltip("Draw a small world-space arrow over each detected marker, indicating its local +X direction projected to the diagram plane.")]
+    public bool drawDetectionOrientationArrows = true;
+    [Tooltip("Arrow length in meters.")]
+    public float detectionOrientationArrowLength = 0.08f;
+    [Tooltip("Arrow width in meters.")]
+    public float detectionOrientationArrowWidth = 0.004f;
+    public Color detectionOrientationArrowColor = Color.green;
+    private readonly Dictionary<int, LineRenderer> orientationArrowById = new Dictionary<int, LineRenderer>();
     public Color uiLabelColor = Color.white;
     public int uiFontSize = 14;
     public Camera uiCamera;
@@ -107,6 +130,27 @@ public class TangramMatcher : MonoBehaviour
     [Tooltip("Log pairwise neighbor angle checks for debugging.")]
     public bool debugLogPairwiseAngles = true;
 
+    [Header("Absolute Orientation Check")]
+    [Tooltip("If true, compare each detection's local +X direction to the diagram piece direction defined by child 'direction' from 'center'.")]
+    public bool useAbsoluteOrientation = true;
+    [Tooltip("Tolerance for absolute orientation difference (degrees). Candidates exceeding this are rejected during relation matching.")]
+    public float absoluteOrientationToleranceDeg = 35f;
+    [Tooltip("Weight converting absolute orientation error (degrees) into meters for relational cost.")]
+    public float absoluteOrientationWeightMetersPerDeg = 0.005f;
+
+    [Header("Orientation Debugging")]
+    [Tooltip("Log absolute orientation differences (center->direction vs marker +X) in the console.")]
+    public bool debugLogOrientationDiff = true;
+    [Tooltip("Log when candidates are rejected due to exceeding absolute orientation tolerance.")]
+    public bool debugLogOrientationRejections = true;
+    [Tooltip("When only one detection of a type exists but multiple diagram pieces of that type are present, assign to the piece with the smallest absolute orientation difference (ignoring relations).")]
+    public bool forceOrientationForSingleDetection = true;
+    [Tooltip("Log per-piece orientation sweep (angle to every candidate piece) for each detection.")]
+    public bool debugLogOrientationSweep = false;
+    [Tooltip("Log per detection the absolute orientation difference to its assigned or best-matching diagram piece (independent of relations).")]
+    [System.NonSerialized]
+    public bool debugLogOrientationPerDetection = true;
+
     [Header("Color Application")]
     [Tooltip("If set, use this shader color property name (e.g., _BaseColor, _Color). If empty, auto-detect common names.")]
     public string overrideColorProperty = "";
@@ -128,6 +172,144 @@ public class TangramMatcher : MonoBehaviour
     public bool useScaleNormalization = true;
     [Tooltip("Use only the nearest already-matched neighbor to compute relation cost (simpler and more stable with sparse links).")]
     public bool useOnlyNearestMatchedNeighbor = true;
+
+    [Header("Plane Normal Override")]
+    [Tooltip("If true, force planar computations to XY plane (normal = +Z). Else, use tangramDiagramRoot.up or world up Y.")]
+    public bool useXYPlane = true;
+
+    [Header("Marker Plane (4-corner gating)")]
+    [Tooltip("Require 4 plane-corner ArUco markers to be detected to run matching.")]
+    public bool requirePlaneCorners = true;
+    [Tooltip("Corner marker IDs in order: Top-Left, Top-Right, Bottom-Right, Bottom-Left")]
+    public int planeCornerIdTL = 10;
+    public int planeCornerIdTR = 11;
+    public int planeCornerIdBR = 12;
+    public int planeCornerIdBL = 13;
+    [Tooltip("Draw debug axes/edges for the detected marker plane.")]
+    public bool debugDrawMarkerPlane = true;
+    [Tooltip("If true and corners missing, show an on-screen message.")]
+    public bool showMissingCornersUI = true;
+
+    // Runtime corner plane state
+    private bool planeCornersReady = false;
+    private Vector3 planeTLWorld, planeTRWorld, planeBRWorld, planeBLWorld;
+    private int planeCornersFrame = -1000;
+
+    [Tooltip("If true, map detections from marker plane (TL,TR,BL) into diagram plane via 2D similarity (translation/rotation/scale) using target width/height.")]
+    public bool useMarkerPlaneSimilarity = true;
+    [Tooltip("Target width (TL->TR) in diagram meters for marker plane mapping.")]
+    public float markerTargetWidthMeters = 1.0f;
+    [Tooltip("Target height (TL->BL) in diagram meters for marker plane mapping.")]
+    public float markerTargetHeightMeters = 1.0f;
+
+    [Header("Prediction (Kalman CV)")]
+    [Tooltip("Use constant-velocity Kalman prediction for locked pieces to improve temporal coherence.")]
+    public bool useKalmanPrediction = true;
+    [Tooltip("Process noise (Q) for Kalman per axis.")]
+    public float kalmanProcessNoise = 1e-2f;
+    [Tooltip("Measurement noise (R) for Kalman per axis.")]
+    public float kalmanMeasurementNoise = 1e-1f;
+
+    [Header("Optimal Assignment")]
+    [Tooltip("Use Hungarian algorithm for per-type multi-detection multi-piece assignment.")]
+    public bool useHungarianForTypeMatching = true;
+
+    // ---------- Gating ----------
+    [Header("Gating")]
+    [Tooltip("Use Mahalanobis gating with Kalman covariance for pre-assignment of locked pieces.")]
+    public bool useMahalanobisGating = true;
+    [Tooltip("Gate width in sigmas (typical 2.5~3.0).")]
+    public float gatingSigma = 2.8f;
+    [Tooltip("If true, gating is done in the diagram plane (X/Z). If false, 3D.")]
+    public bool gatingPlanar = true;
+
+    // ---------- Relation Filtering ----------
+    [Header("Relation Filtering")]
+    [Tooltip("Compare detection relations only against diagram GRAPH EDGES (adjacent nodes).")]
+    public bool restrictRelationsToGraphEdges = true;
+    [Tooltip("Maximum allowed |Δdistance| in meters for a relation candidate to be considered.")]
+    public float relationMaxDistDiff = 0.12f;
+    [Tooltip("Maximum allowed |Δangle| in degrees for a relation candidate to be considered.")]
+    public float relationMaxAngleDiffDeg = 30f;
+    [Tooltip("If true, log only PASSED relations; candidates are logged with a different tag.")]
+    public bool verboseRelationDebug = false;
+
+    [Header("Relation Debugging")]
+    [Tooltip("If true, after matching, report diffs for ALL diagram edges touching matched pieces (even if relation was not used in matching).")]
+    public bool debugAllDiagramEdges = true;
+    [Tooltip("Limit number of diagram edges to report per node. 0 = all.")]
+    public int debugEdgesReportPerNode = 0;
+    [Tooltip("Draw debug lines for diagram edges during relation reporting.")]
+    public bool drawRelationEdgeLines = false;
+
+    [Header("Detection Relation Debugging")]
+    [Tooltip("If true, also report distances/angles between DETECTED shapes (detection graph edges).")]
+    public bool debugDetectionRelations = true;
+    [Tooltip("Limit number of detection relations to report per node. 0 = all.")]
+    public int debugDetectionRelationsPerNode = 0;
+    [Tooltip("Draw debug lines for detection relations during reporting.")]
+    public bool drawDetectionRelationLines = false;
+    [Tooltip("Restrict relation comparisons to pairs that are connected by an edge in the diagram graph (expected relations only).")]
+    public bool restrictRelationsToDiagramEdges = true;
+    [Tooltip("If true, when a detection lacks a current-frame match, fall back to the last assigned piece for expected relation lookup (reduces '(no expected)' flicker).")]
+    public bool useExpectedFallbackFromLastAssignment = true;
+    [Tooltip("If true, suppress logging of '(no expected)' relation lines; only log when expectations are available.")]
+    public bool suppressNoExpectedRelationLogs = true;
+
+    [Header("Detection Buffering")]
+    [Tooltip("Number of recent frames to buffer for corner gating and detection fusion.")]
+    public int detectionBufferWindow = 4;
+    private readonly Queue<(int frame, List<DetectedShape> items)> recentDetectionsBuffer = new Queue<(int frame, List<DetectedShape> items)>();
+    // Optional external corner feed buffer (raw positions by ID)
+    private readonly Queue<(int frame, Dictionary<int, Vector3> corners)> recentCornerBuffer = new Queue<(int frame, Dictionary<int, Vector3> corners)>();
+
+    /// <summary>
+    /// Optional: externally register a single corner marker observation (world position) for fusion over the buffer window.
+    /// Call this when ArUco 10/11/12/13 are detected, even if they are not included in SetDetections.
+    /// </summary>
+    public void RegisterCornerObservation(int arucoId, Vector3 worldPosition)
+    {
+        var dict = new Dictionary<int, Vector3> { { arucoId, worldPosition } };
+        recentCornerBuffer.Enqueue((frameCounter, dict));
+        while (recentCornerBuffer.Count > Mathf.Max(1, detectionBufferWindow)) recentCornerBuffer.Dequeue();
+    }
+
+    /// <summary>
+    /// Optional: externally register multiple corner marker observations in a single call.
+    /// Provide a map of arucoId -> worldPosition for any subset of {TL, TR, BR, BL}.
+    /// </summary>
+    public void RegisterCornerObservations(Dictionary<int, Vector3> corners)
+    {
+        if (corners == null || corners.Count == 0) return;
+        recentCornerBuffer.Enqueue((frameCounter, new Dictionary<int, Vector3>(corners)));
+        while (recentCornerBuffer.Count > Mathf.Max(1, detectionBufferWindow)) recentCornerBuffer.Dequeue();
+    }
+
+    [Header("Hysteresis / Stickiness")]
+    [Tooltip("Prefer the previously assigned diagram piece for a detection unless a new candidate improves cost beyond a threshold.")]
+    public bool preferPreviousAssignment = true;
+    [Tooltip("Minimal cost improvement (meters-equivalent) required to switch assignment away from the previous piece.")]
+    public float switchCostImprovementThreshold = 0.10f;
+    [Tooltip("Cost bias in meters-equivalent to prefer previous assignment during multi-detection assignment.")]
+    public float previousAssignmentBiasMeters = 0.05f;
+    [Tooltip("Prevent switching within this many frames unless improvement beats threshold.")]
+    public int assignmentCooldownFrames = 20;
+    [Tooltip("Extra penalty (meters-equivalent) applied to switching during cooldown.")]
+    public float cooldownPenaltyMeters = 0.3f;
+
+    [Header("Stateful Matching & Confidence")]
+    [Tooltip("Enable locking of stable matches across frames for temporal coherence.")]
+    public bool enableStatefulMatching = true;
+    [Tooltip("Confidence gain per successful re-detection (0..1).")]
+    public float confidenceGainPerHit = 0.2f;
+    [Tooltip("Confidence decay per frame when not seen (0..1).")]
+    public float confidenceDecayPerFrame = 0.05f;
+    [Tooltip("Confidence threshold to lock a piece match.")]
+    public float lockConfidenceThreshold = 0.7f;
+    [Tooltip("Confidence threshold to unlock a previously locked piece.")]
+    public float unlockConfidenceThreshold = 0.2f;
+    [Tooltip("Max distance to re-associate a detection to a locked piece (meters).")]
+    public float relockMaxDistanceMeters = 0.15f;
 
     /// <summary>
     /// Types of Tangram shapes supported.
@@ -152,6 +334,7 @@ public class TangramMatcher : MonoBehaviour
         public Vector3 worldPosition;
         public Quaternion worldRotation;
         public float confidence; // 0..1 optional
+        public bool isCorner; // true if this detection is one of the 4 plane corner markers
     }
 
     /// <summary>
@@ -193,6 +376,8 @@ public class TangramMatcher : MonoBehaviour
     // MaterialPropertyBlock to avoid material instantiation
     private MaterialPropertyBlock sharedPropertyBlock;
     private GUIStyle cachedLabelStyle;
+    // Queue REL logs and flush at end of frame to avoid (no expected) timing artifacts
+    private readonly List<string> relLogQueue = new List<string>();
     
     // Original color cache per renderer/material index
     private class SubMaterialColorInfo
@@ -224,6 +409,45 @@ public class TangramMatcher : MonoBehaviour
         public readonly Dictionary<Transform, int> indexByTransform = new Dictionary<Transform, int>();
     }
     private DiagramGraph diagramGraph = new DiagramGraph();
+    
+    // Fast diagram edge membership set
+    private readonly HashSet<ulong> diagramEdgeSet = new HashSet<ulong>();
+    private static ulong EdgeKey(int a, int b) => ((ulong)(uint)a << 32) | (uint)(b);
+    private bool IsDiagramEdge(int i, int j)
+    {
+        return diagramEdgeSet.Contains(EdgeKey(i, j)) || diagramEdgeSet.Contains(EdgeKey(j, i));
+    }
+
+    // Stateful matching data
+    private int frameCounter = 0;
+    private class LockedState
+    {
+        public Transform piece;
+        public TangramShapeType type;
+        public float confidence;
+        public Vector3 lastPosition;
+        public Vector3 lastVelocity;
+        public int lastSeenFrame;
+        public bool isLocked;
+        // Kalman state per axis: position/velocity and covariance terms
+        public bool kalmanInitialized;
+        public Vector3 kPos;
+        public Vector3 kVel;
+        // Covariance for each axis (2x2): [p11 p12; p21 p22]
+        public Vector4 kCovX; // (p11, p12, p21, p22)
+        public Vector4 kCovY;
+        public Vector4 kCovZ;
+    }
+    private readonly Dictionary<Transform, LockedState> lockedByPiece = new Dictionary<Transform, LockedState>();
+    private readonly Dictionary<int, Transform> preAssignedDetections = new Dictionary<int, Transform>();
+    // Remember last assignment per detection type/key (single-id tracking)
+    private readonly Dictionary<(TangramShapeType type, int arucoId), Transform> lastAssignedPieceByKey = new Dictionary<(TangramShapeType, int), Transform>();
+
+    // Cached per-frame normalization baselines (subset reference)
+    private float cachedBaselineDetRef = 1f;
+    private float cachedBaselineExpRef = 1f;
+    private int cachedBaselineFrame = -1;
+    private bool cachedBaselineValid = false;
 
     void Awake()
     {
@@ -274,6 +498,21 @@ public class TangramMatcher : MonoBehaviour
         // Build diagram graph from current children
         BuildDiagramGraph();
 
+        // Build fast edge set for relation filtering
+        diagramEdgeSet.Clear();
+        if (diagramGraph != null)
+        {
+            for (int i = 0; i < diagramGraph.nodes.Count; i++)
+            {
+                var ni = diagramGraph.nodes[i];
+                for (int e = 0; e < ni.edges.Count; e++)
+                {
+                    int j = ni.edges[e].toIndex;
+                    diagramEdgeSet.Add(EdgeKey(i, j));
+                }
+            }
+        }
+
         if (debugLogDiagramGraph)
         {
             DebugLogDiagramGraph();
@@ -302,7 +541,145 @@ public class TangramMatcher : MonoBehaviour
     {
         latestDetections.Clear();
         if (detections != null)
-            latestDetections.AddRange(detections);
+        {
+            foreach (var d in detections)
+            {
+                // Pass through corner IDs even if TryMapArucoIdToShape would ignore them upstream
+                bool isCornerId = (d.arucoId == planeCornerIdTL || d.arucoId == planeCornerIdTR || d.arucoId == planeCornerIdBR || d.arucoId == planeCornerIdBL);
+                if (!isCornerId)
+                {
+                    latestDetections.Add(d);
+                }
+                else
+                {
+                    var dd = d;
+                    dd.isCorner = true;
+                    latestDetections.Add(dd);
+                }
+            }
+        }
+
+        // push into buffer
+        recentDetectionsBuffer.Enqueue((frameCounter, new List<DetectedShape>(latestDetections)));
+        while (recentDetectionsBuffer.Count > Mathf.Max(1, detectionBufferWindow)) recentDetectionsBuffer.Dequeue();
+
+        // union of detections over buffer window for robust gating
+        var fusedDetections = FuseBufferedDetections();
+
+        // 4-corner gating: ensure all plane markers are present
+        if (requirePlaneCorners)
+        {
+            UpdatePlaneCornersFromList(fusedDetections);
+            if (!planeCornersReady)
+            {
+                // Skip matching; optionally draw UI message
+                if (showMissingCornersUI)
+                {
+                    int tl=0,tr=0,br=0,bl=0;
+                    foreach (var d in fusedDetections)
+                    {
+                        if (d.arucoId == planeCornerIdTL) tl=1;
+                        else if (d.arucoId == planeCornerIdTR) tr=1;
+                        else if (d.arucoId == planeCornerIdBR) br=1;
+                        else if (d.arucoId == planeCornerIdBL) bl=1;
+                    }
+                    Debug.Log($"[TangramMatcher] Corner markers not detected – skipping matching. present(TL={tl}, TR={tr}, BR={br}, BL={bl}) window={detectionBufferWindow}");
+                }
+                return;
+            }
+            // Overwrite detection positions with median-fused positions (non-corner) to reduce jitter
+            var medById = new Dictionary<int, Vector3>();
+            foreach (var d in fusedDetections) if (!d.isCorner) medById[d.arucoId] = d.worldPosition;
+            for (int i = 0; i < latestDetections.Count; i++)
+            {
+                if (latestDetections[i].isCorner) continue;
+                if (medById.TryGetValue(latestDetections[i].arucoId, out var mp))
+                {
+                    var tmp = latestDetections[i]; tmp.worldPosition = mp; latestDetections[i] = tmp;
+                }
+            }
+            // Apply similarity mapping to align to diagram plane/scale
+            if (useMarkerPlaneSimilarity)
+            {
+                ApplyMarkerPlaneSimilarityMapping();
+            }
+            else
+            {
+                // simple projection only
+                Vector3 planeNormal = Vector3.Normalize(Vector3.Cross(planeTRWorld - planeTLWorld, planeBLWorld - planeTLWorld));
+                for (int i = 0; i < latestDetections.Count; i++)
+                {
+                    var d = latestDetections[i];
+                    Vector3 p = d.worldPosition;
+                    Vector3 pProj = p - Vector3.Dot(p - planeTLWorld, planeNormal) * planeNormal;
+                    d.worldPosition = pProj;
+                    latestDetections[i] = d;
+                }
+            }
+        }
+
+        frameCounter++;
+        if (enableStatefulMatching)
+        {
+            // Pre-assignment: try to re-associate detections to locked pieces of same type within distance
+            preAssignedDetections.Clear();
+            foreach (var kv in lockedByPiece)
+            {
+                var ls = kv.Value;
+                if (!ls.isLocked) continue;
+                // predict with Kalman CV
+                Vector3 predicted;
+                if (useKalmanPrediction)
+                {
+                    predicted = KalmanPredict(ls, Time.deltaTime);
+                }
+                else
+                {
+                    predicted = ls.lastPosition + ls.lastVelocity * Time.deltaTime;
+                }
+                // ★ REPLACE ★: pre-assign to locked pieces with gating
+                int bestIdx = -1;
+                float bestScore = float.PositiveInfinity;
+
+                for (int i = 0; i < latestDetections.Count; i++)
+                {
+                    if (preAssignedDetections.ContainsKey(i)) continue;
+                    var d = latestDetections[i];
+                    if (d.shapeType != ls.type) continue;
+
+                    bool pass;
+                    float score;
+
+                    if (useMahalanobisGating && ls.kalmanInitialized)
+                    {
+                        score = MahalanobisDistanceSquared(ls, d.worldPosition, gatingPlanar);
+                        pass = score <= gatingSigma * gatingSigma;
+                    }
+                    else
+                    {
+                        // Euclidean fallback gate
+                        score = Vector3.Distance(d.worldPosition, predicted);
+                        pass = score <= relockMaxDistanceMeters;
+                    }
+
+                    if (pass && score < bestScore)
+                    {
+                        bestScore = score;
+                        bestIdx = i;
+                    }
+                }
+
+                if (bestIdx >= 0)
+                {
+                    preAssignedDetections[bestIdx] = ls.piece;
+                    // Keep filter tight
+                    if (useKalmanPrediction)
+                    {
+                        KalmanUpdate(ls, latestDetections[bestIdx].worldPosition);
+                    }
+                }
+            }
+        }
 
         RunMatchingAndHighlight();
     }
@@ -331,8 +708,14 @@ public class TangramMatcher : MonoBehaviour
         {
             int arucoId = (int)ids.get(i, 0)[0];
 
+            bool isCornerId = (arucoId == planeCornerIdTL || arucoId == planeCornerIdTR || arucoId == planeCornerIdBR || arucoId == planeCornerIdBL);
             if (!TryMapArucoIdToShape(arucoId, out TangramShapeType shapeType))
-                continue; // ignore unknown ids
+            {
+                if (!isCornerId)
+                    continue; // ignore unknown non-corner ids
+                // Allow corner ids through with a placeholder shape type (won't be used for matching)
+                shapeType = TangramShapeType.Square;
+            }
 
             // Read tvec (position in camera coords, meters)
             double[] t = tvecs.get(i, 0);
@@ -376,8 +759,56 @@ public class TangramMatcher : MonoBehaviour
                 shapeType = shapeType,
                 worldPosition = worldPos,
                 worldRotation = worldRot,
-                confidence = 1f
+                confidence = 1f,
+                isCorner = isCornerId
             });
+        }
+        // 4-corner gating and homography-based 2D mapping
+        if (requirePlaneCorners)
+        {
+            // push into buffer and fuse
+            recentDetectionsBuffer.Enqueue((frameCounter, new List<DetectedShape>(latestDetections)));
+            while (recentDetectionsBuffer.Count > Mathf.Max(1, detectionBufferWindow)) recentDetectionsBuffer.Dequeue();
+            var fused = FuseBufferedDetections();
+            UpdatePlaneCornersFromList(fused);
+            if (!planeCornersReady)
+            {
+                int tl=0,tr=0,br=0,bl=0;
+                foreach (var d in fused)
+                {
+                    if (d.arucoId == planeCornerIdTL) tl=1;
+                    else if (d.arucoId == planeCornerIdTR) tr=1;
+                    else if (d.arucoId == planeCornerIdBR) br=1;
+                    else if (d.arucoId == planeCornerIdBL) bl=1;
+                }
+                Debug.Log($"[TangramMatcher] Corner markers not detected – skipping matching. present(TL={tl}, TR={tr}, BR={br}, BL={bl}) window={detectionBufferWindow}");
+                return;
+            }
+            // Optional: draw plane edges for debug
+            if (debugDrawMarkerPlane)
+            {
+                Debug.DrawLine(planeTLWorld, planeTRWorld, Color.cyan, 0f, false);
+                Debug.DrawLine(planeTRWorld, planeBRWorld, Color.cyan, 0f, false);
+                Debug.DrawLine(planeBRWorld, planeBLWorld, Color.cyan, 0f, false);
+                Debug.DrawLine(planeBLWorld, planeTLWorld, Color.cyan, 0f, false);
+            }
+            if (useMarkerPlaneSimilarity)
+            {
+                ApplyMarkerPlaneSimilarityMapping();
+            }
+            else
+            {
+                // simple projection only
+                Vector3 planeNormal = Vector3.Normalize(Vector3.Cross(planeTRWorld - planeTLWorld, planeBLWorld - planeTLWorld));
+                for (int i = 0; i < latestDetections.Count; i++)
+                {
+                    var d = latestDetections[i];
+                    Vector3 p = d.worldPosition;
+                    Vector3 pProj = p - Vector3.Dot(p - planeTLWorld, planeNormal) * planeNormal;
+                    d.worldPosition = pProj;
+                    latestDetections[i] = d;
+                }
+            }
         }
 
         RunMatchingAndHighlight();
@@ -407,6 +838,90 @@ public class TangramMatcher : MonoBehaviour
         // Absolute greedy matching removed – use graph-only matching
         RunGraphOnlyMatching(availablePieces, matchedPieceSet, linkSegments);
 
+        // Orientation-only assignment fallback:
+        // If a shape type has exactly 1 detection and multiple diagram pieces remain for that type,
+        // assign it to the piece with the smallest absolute orientation difference (ignoring relations),
+        // but only if the piece is not already matched in this frame.
+        if (forceOrientationForSingleDetection && useAbsoluteOrientation)
+        {
+            var detectionsByType = new Dictionary<TangramShapeType, List<int>>();
+            for (int i = 0; i < latestDetections.Count; i++)
+            {
+                var d = latestDetections[i];
+                if (d.isCorner) continue;
+                if (!detectionsByType.TryGetValue(d.shapeType, out var list))
+                {
+                    list = new List<int>();
+                    detectionsByType[d.shapeType] = list;
+                }
+                list.Add(i);
+            }
+            foreach (var kv in detectionsByType)
+            {
+                var type = kv.Key;
+                var list = kv.Value;
+                if (list.Count != 1) continue;
+                // Collect remaining unmatched diagram pieces of this type
+                if (!diagramPiecesByType.TryGetValue(type, out var allPieces)) continue;
+                var remaining = new List<Transform>();
+                foreach (var p in allPieces) if (!matchedPieceSet.Contains(p)) remaining.Add(p);
+                if (remaining.Count <= 1) continue;
+
+                int detIndex = list[0];
+                var det = latestDetections[detIndex];
+                Vector3 planeN = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
+                Vector3 detDir = Vector3.ProjectOnPlane(det.worldRotation * Vector3.right, planeN).normalized;
+                if (detDir.sqrMagnitude < 1e-6f) continue;
+
+                float bestAng = float.PositiveInfinity;
+                Transform bestPiece = null;
+                if (debugLogOrientationSweep)
+                {
+                    Debug.Log($"[TangramMatcher] ORI sweep for det({type}:{det.arucoId}) vs {remaining.Count} candidates");
+                }
+                foreach (var piece in remaining)
+                {
+                    Vector3 pieceDir = Vector3.ProjectOnPlane(GetPieceDirectionVector(piece), planeN).normalized;
+                    if (pieceDir.sqrMagnitude < 1e-6f) continue;
+                    float a = Mathf.Abs(Vector3.SignedAngle(pieceDir, detDir, planeN));
+                    a = NormalizeAngle180(a);
+                    float mod = GetSymmetryModuloDegrees(type);
+                    if (mod > 0f)
+                    {
+                        a = a % mod;
+                        a = Mathf.Min(a, mod - a);
+                    }
+                    if (debugLogOrientationSweep)
+                    {
+                        Debug.Log($"[TangramMatcher]   -> diag({piece.name}) absOri={a:F1}°");
+                    }
+                    if (a < bestAng)
+                    {
+                        bestAng = a;
+                        bestPiece = piece;
+                    }
+                }
+                if (bestPiece != null)
+                {
+                    matchedPieceSet.Add(bestPiece);
+                    float absDist = Vector3.Distance(det.worldPosition, GetPieceCenterWorld(bestPiece));
+                    lastMatchResults.Add(new MatchResult
+                    {
+                        shapeType = type,
+                        arucoId = det.arucoId,
+                        matchedPieceTransform = bestPiece,
+                        worldDistanceMeters = absDist,
+                        detectionWorldPosition = det.worldPosition,
+                        angleErrorDegrees = bestAng
+                    });
+                    if (debugLogOrientationDiff)
+                    {
+                        Debug.Log($"[TangramMatcher] ORI assign (single det) {type}:{det.arucoId} -> diag({bestPiece.name}) | absOri={bestAng:F1}°");
+                    }
+                }
+            }
+        }
+
         // Error stats per type
         ComputeAndStoreErrorStats();
 
@@ -432,11 +947,45 @@ public class TangramMatcher : MonoBehaviour
             }
         }
 
-        // Debug log in English for clarity (including nearest graph neighbor info)
+        // Update cached baselines ONCE per frame after matching
+        UpdateCachedBaselinesFromLastResults();
+
+        // Debug log in English for clarity
         foreach (var result in lastMatchResults)
         {
             string graphInfo = BuildGraphDebugInfo(result);
             Debug.Log($"[TangramMatcher] Matched {result.shapeType} (ArUco {result.arucoId}) -> Piece '{result.matchedPieceTransform.name}', distance = {result.worldDistanceMeters:F3} m, angle = {result.angleErrorDegrees:F1} deg. {graphInfo}");
+            if (debugLogOrientationPerDetection && useAbsoluteOrientation)
+            {
+                // Report absolute orientation difference (independent of relations) for this detection vs its assigned piece
+                Vector3 planeN = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
+                var det = FindDetection(result.shapeType, result.arucoId);
+                if (det.HasValue)
+                {
+                    Vector3 detDir = Vector3.ProjectOnPlane(det.Value.worldRotation * Vector3.right, planeN).normalized;
+                    Vector3 pieceDir = Vector3.ProjectOnPlane(GetPieceDirectionVector(result.matchedPieceTransform), planeN).normalized;
+                    if (detDir.sqrMagnitude > 1e-6f && pieceDir.sqrMagnitude > 1e-6f)
+                    {
+                        float a = Mathf.Abs(Vector3.SignedAngle(pieceDir, detDir, planeN));
+                        a = NormalizeAngle180(a);
+                        float mod = GetSymmetryModuloDegrees(result.shapeType);
+                        if (mod > 0f)
+                        {
+                            a = a % mod;
+                            a = Mathf.Min(a, mod - a);
+                        }
+                        Debug.Log($"[TangramMatcher] ORI report {result.shapeType}:{result.arucoId} -> diag({result.matchedPieceTransform.name}) | absOri={a:F1}°");
+                    }
+                }
+            }
+            if (debugAllDiagramEdges)
+            {
+                ReportAllDiagramEdgeDiffs(result, debugEdgesReportPerNode);
+            }
+            if (debugDetectionRelations)
+            {
+                ReportDetectionRelations(result, debugDetectionRelationsPerNode, drawDetectionRelationLines);
+            }
         }
 
         if (debugLogPerTypeErrorStats)
@@ -447,6 +996,16 @@ public class TangramMatcher : MonoBehaviour
                 Debug.Log($"[TangramMatcher] Error stats for {kv.Key} -> count={s.count}, min={s.min:F3}m, max={s.max:F3}m, avg={s.avg:F3}m");
             }
         }
+
+        // Flush REL logs at end of frame
+        if (relLogQueue.Count > 0)
+        {
+            foreach (var line in relLogQueue) Debug.Log(line);
+            relLogQueue.Clear();
+        }
+
+        // Update orientation arrows for markers
+        UpdateDetectionOrientationArrows();
     }
 
     private void ApplyDebugColors(HashSet<Transform> matchedPieces)
@@ -623,7 +1182,7 @@ public class TangramMatcher : MonoBehaviour
         for (int i = 0; i < diagramGraph.nodes.Count; i++)
         {
             var ni = diagramGraph.nodes[i];
-            Vector3 pi = ni.piece.position;
+            Vector3 pi = GetPieceCenterWorld(ni.piece);
             int bestJ = -1;
             float bestDist = float.PositiveInfinity;
             float bestNorm = float.PositiveInfinity;
@@ -633,7 +1192,7 @@ public class TangramMatcher : MonoBehaviour
             {
                 if (i == j) continue;
                 var nj = diagramGraph.nodes[j];
-                Vector3 pj = nj.piece.position;
+                Vector3 pj = GetPieceCenterWorld(nj.piece);
 
                 float centerDist = Vector3.Distance(pi, pj);
                 float norm = (ni.sizeMeters + nj.sizeMeters);
@@ -716,14 +1275,34 @@ public class TangramMatcher : MonoBehaviour
         // Strategy: seed with the detection that has the most neighbors; map it to the diagram piece of same type with highest graph degree (no absolute coords).
         // Then expand frontier: only match detections that have at least one already-matched neighbor, and only to diagram pieces that are neighbors of at least one matched diagram neighbor.
 
+        // Special handling: when exactly 2 non-corner detections are present, ignore relation distance terms
+        // and use only center-to-center angle and absolute orientation for matching.
+        int nonCornerCount = 0;
+        for (int i = 0; i < latestDetections.Count; i++) if (!latestDetections[i].isCorner) nonCornerCount++;
+        bool angleOnlyForTwoDetections = (nonCornerCount == 2);
+
         // Order nodes by decreasing degree
         var order = new List<int>();
         for (int i = 0; i < dg.nodes.Count; i++) order.Add(i);
         order.Sort((a, b) => dg.nodes[b].neighbors.Count.CompareTo(dg.nodes[a].neighbors.Count));
 
-        // Track which diagram pieces remain per type
+        // Track which diagram pieces remain per type, skipping locked ones
         var remainingByType = new Dictionary<TangramShapeType, List<Transform>>();
-        foreach (var kv in availablePieces) remainingByType[kv.Key] = new List<Transform>(kv.Value);
+        foreach (var kv in availablePieces)
+        {
+            var list = new List<Transform>();
+            foreach (var p in kv.Value)
+            {
+                if (enableStatefulMatching && lockedByPiece.TryGetValue(p, out var ls) && ls.isLocked)
+                {
+                    // keep it colored and accounted, but exclude from remaining
+                    matchedPieceSet.Add(p);
+                    continue;
+                }
+                list.Add(p);
+            }
+            remainingByType[kv.Key] = list;
+        }
 
         var detToPiece = new Dictionary<int, Transform>();
         var assignedDetectionIndices = new HashSet<int>();
@@ -738,6 +1317,31 @@ public class TangramMatcher : MonoBehaviour
 
             if (!remainingByType.TryGetValue(node.type, out var candidates) || candidates.Count == 0)
                 continue;
+
+            // Pre-assigned to locked piece?
+            if (enableStatefulMatching)
+            {
+                int detIndex = node.detIndex;
+                if (preAssignedDetections.TryGetValue(detIndex, out var lockedPiece))
+                {
+                    detToPiece[nodeIdx] = lockedPiece;
+                    assignedDetectionIndices.Add(nodeIdx);
+                    matchedPieceSet.Add(lockedPiece);
+                    var det = latestDetections[detIndex];
+                    float absDist = Vector3.Distance(det.worldPosition, GetPieceCenterWorld(lockedPiece));
+                    float absAng = ComputeAngleError(det.shapeType, det.worldRotation, lockedPiece);
+                    lastMatchResults.Add(new MatchResult
+                    {
+                        shapeType = det.shapeType,
+                        arucoId = det.arucoId,
+                        matchedPieceTransform = lockedPiece,
+                        worldDistanceMeters = absDist,
+                        detectionWorldPosition = det.worldPosition,
+                        angleErrorDegrees = absAng
+                    });
+                    continue;
+                }
+            }
 
             Transform chosen = null;
             float chosenCost = float.PositiveInfinity;
@@ -762,7 +1366,7 @@ public class TangramMatcher : MonoBehaviour
                     continue; // no graph-consistent options, skip
             }
 
-            // Multi-detection assignment for duplicate types: choose configuration that maximizes number of matches, then minimal total cost
+            // Multi-detection assignment for duplicate types: choose configuration that maximizes number of matches, then minimal total cost, with stickiness bias
             if (remainingByType.TryGetValue(node.type, out var remainingForType) && remainingForType.Count >= 2)
             {
                 var detIndices = new List<int>();
@@ -797,23 +1401,166 @@ public class TangramMatcher : MonoBehaviour
                         {
                             foreach (var p in pool)
                             {
-                                if (!TryComputeRelationalCostForCandidate(di, p, dg, detToPiece, out float d, out float a, out _, out int cnt))
-                                    continue;
-                                if (d <= graphDistanceToleranceMeters && a <= graphAngleToleranceDeg)
+                                // If restricting relations to diagram edges, ensure the nearest matched neighbor forms an edge
+                                if (restrictRelationsToGraphEdges)
                                 {
-                                    float cost = d + rotationWeightMetersPerDeg * a;
+                                    // Check existence of at least one matched neighbor that is an edge to p
+                                    bool hasEdge = false;
+                                    foreach (int nn in dg.nodes[di].neighbors)
+                                    {
+                                        if (!detToPiece.TryGetValue(nn, out var np)) continue;
+                                        if (!diagramGraph.indexByTransform.TryGetValue(p, out int ip)) continue;
+                                        if (!diagramGraph.indexByTransform.TryGetValue(np, out int inb)) continue;
+                                        if (IsDiagramEdge(ip, inb)) { hasEdge = true; break; }
+                                    }
+                                    if (!hasEdge) continue;
+                                }
+                                if (!TryComputeRelationalCostForCandidate(di, p, dg, detToPiece, out float d, out float a, out float usedScale, out int cnt))
+                                    continue;
+                                bool passGating = angleOnlyForTwoDetections ? (a <= graphAngleToleranceDeg) : (d <= graphDistanceToleranceMeters && a <= graphAngleToleranceDeg);
+                                if (passGating)
+                                {
+                                    // Replace distance component with normalized ratio if enabled
+                                    float distanceCost2 = angleOnlyForTwoDetections ? 0f : d;
+                                    if (useNormalizedRelationDistance)
+                                    {
+                                        if (!angleOnlyForTwoDetections)
+                                        {
+                                        int nearestIdx2 = -1; float nearestDet2 = float.PositiveInfinity; Transform nearestPiece2 = null;
+                                        foreach (int nIdx in dg.nodes[di].neighbors)
+                                        {
+                                            if (!detToPiece.TryGetValue(nIdx, out var np)) continue;
+                                            float dnn = Vector3.Distance(dg.nodes[nIdx].pos, dg.nodes[di].pos);
+                                            if (dnn < nearestDet2) { nearestDet2 = dnn; nearestIdx2 = nIdx; nearestPiece2 = np; }
+                                        }
+                                        float baseline;
+                                        if (useSubsetUnifiedBaseline)
+                                        {
+                                            float subDet = GetCurrentMatchedSubsetMaxDetectionEdgeDistance(dg, detToPiece);
+                                            float subExp = GetCurrentMatchedSubsetMaxDiagramEdgeExpected(detToPiece);
+                                            baseline = Mathf.Max(1e-4f, subDet, subExp);
+                                        }
+                                        else
+                                        {
+                                            float baseDet = GetDetectionMaxPairDistance();
+                                            float baseExp = GetDiagramMaxEdgeLength();
+                                            baseline = Mathf.Max(1e-4f, baseDet, baseExp);
+                                        }
+                                        if (baseline > 1e-4f)
+                                        {
+                                            Vector3 planeN2 = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
+                                            Vector3 vDetP2 = Vector3.ProjectOnPlane(dg.nodes[nearestIdx2].pos - dg.nodes[di].pos, planeN2);
+                                            Vector3 vDiagP2 = Vector3.ProjectOnPlane(GetPieceCenterWorld(nearestPiece2) - GetPieceCenterWorld(p), planeN2);
+                                            float rDet = vDetP2.magnitude / baseline;
+                                            float rDiag = vDiagP2.magnitude / baseline;
+                                            distanceCost2 = Mathf.Abs(rDet - rDiag);
+                                        }
+                                        }
+                                    }
+                                    float cost = distanceCost2 + rotationWeightMetersPerDeg * a;
+                                    if (useAbsoluteDistanceInCost)
+                                    {
+                                        var detx = latestDetections[node.detIndex];
+                                        float absDistX = Vector3.Distance(detx.worldPosition, GetPieceCenterWorld(p));
+                                        cost += absoluteDistanceWeightMeters * absDistX;
+                                    }
+                                    // Add scale penalty: weighted |scale-1|
+                                    float scalePenalty = Mathf.Abs(usedScale - 1f) * 0.1f; // weight = 0.1 meters per unit scale deviation
+                                    cost += scalePenalty;
+
+                                    // Optional absolute orientation gating/cost
+                                    if (useAbsoluteOrientation)
+                                    {
+                                        var det = latestDetections[node.detIndex];
+                                        Vector3 planeNPairs = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
+                                        Vector3 detDir = Vector3.ProjectOnPlane(det.worldRotation * Vector3.right, planeNPairs).normalized;
+                                        Vector3 pieceDir = Vector3.ProjectOnPlane(GetPieceDirectionVector(p), planeNPairs).normalized;
+                                        if (detDir.sqrMagnitude > 1e-6f && pieceDir.sqrMagnitude > 1e-6f)
+                                        {
+                                            float absOriDeg = Mathf.Abs(Vector3.SignedAngle(pieceDir, detDir, planeNPairs));
+                                            absOriDeg = NormalizeAngle180(absOriDeg);
+                                            float mod = GetSymmetryModuloDegrees(node.type);
+                                            if (mod > 0f)
+                                            {
+                                                absOriDeg = absOriDeg % mod;
+                                                absOriDeg = Mathf.Min(absOriDeg, mod - absOriDeg);
+                                            }
+                                            if (absOriDeg > absoluteOrientationToleranceDeg)
+                                            {
+                                                // Reject candidate if outside tolerance
+                                                if (debugLogOrientationRejections)
+                                                {
+                                                    Debug.Log($"[TangramMatcher] ORI REJECT det({node.type}:{latestDetections[node.detIndex].arucoId}) -> diag({p.name}) | absOri={absOriDeg:F1}° > tol={absoluteOrientationToleranceDeg:F1}°");
+                                                }
+                                                continue;
+                                            }
+                                            if (debugLogOrientationDiff)
+                                            {
+                                                Debug.Log($"[TangramMatcher] ORI diff det({node.type}:{latestDetections[node.detIndex].arucoId}) -> diag({p.name}) | absOri={absOriDeg:F1}°");
+                                            }
+                                            cost += absoluteOrientationWeightMetersPerDeg * absOriDeg;
+                                        }
+                                    }
+                                    if (preferPreviousAssignment)
+                                    {
+                                        var key = (dg.nodes[di].type, latestDetections[node.detIndex].arucoId);
+                                        if (lastAssignedPieceByKey.TryGetValue(key, out var prev) && prev == p)
+                                        {
+                                            cost = Mathf.Max(0f, cost - previousAssignmentBiasMeters);
+                                        }
+                                        else if (lastAssignedPieceByKey.TryGetValue(key, out var prevPiece) && prevPiece != null)
+                                        {
+                                            // apply cooldown penalty if switching within cooldown frames
+                                            // (we need the last switch frame; approximate using lockedByPiece lastSeenFrame if exists)
+                                            if (lockedByPiece.TryGetValue(prevPiece, out var ls) && frameCounter - ls.lastSeenFrame <= assignmentCooldownFrames)
+                                            {
+                                                cost += cooldownPenaltyMeters;
+                                            }
+                                        }
+                                    }
                                     pairs.Add((di, p, cost, d, a));
                                 }
                             }
                         }
-                        // Greedy by ascending cost to maximize matches
-                        pairs.Sort((x, y) => x.cost.CompareTo(y.cost));
+                        // Assignment: Hungarian (optional) else greedy
                         var usedDet = new HashSet<int>();
                         var usedPiece = new HashSet<Transform>();
-                        foreach (var pr in pairs)
+                        if (useHungarianForTypeMatching)
                         {
-                            if (usedDet.Contains(pr.di) || usedPiece.Contains(pr.piece)) continue;
-                            usedDet.Add(pr.di); usedPiece.Add(pr.piece);
+                            // map detIndices and pool to compact indices
+                            var detMap = new Dictionary<int, int>();
+                            for (int k = 0; k < detIndices.Count; k++) detMap[detIndices[k]] = k;
+                            var pieceList = new List<Transform>(pool);
+                            var pieceMap = new Dictionary<Transform, int>();
+                            for (int k = 0; k < pieceList.Count; k++) pieceMap[pieceList[k]] = k;
+                            // build cost matrix with large cost for invalid pairs
+                            int R = detIndices.Count, C = pieceList.Count;
+                            float[,] costMat = new float[R, C];
+                            float BIG = 1e6f;
+                            for (int r = 0; r < R; r++) for (int c = 0; c < C; c++) costMat[r, c] = BIG;
+                            foreach (var pr in pairs)
+                            {
+                                int r = detMap[pr.di]; int c = pieceMap[pr.piece];
+                                costMat[r, c] = pr.cost;
+                            }
+                            int[] assign = HungarianSolve(costMat);
+                            for (int r = 0; r < assign.Length; r++)
+                            {
+                                int c = assign[r];
+                                if (c < 0 || c >= C) continue;
+                                if (costMat[r, c] >= BIG * 0.5f) continue;
+                                usedDet.Add(detIndices[r]);
+                                usedPiece.Add(pieceList[c]);
+                            }
+                        }
+                        else
+                        {
+                            pairs.Sort((x, y) => x.cost.CompareTo(y.cost));
+                            foreach (var pr in pairs)
+                            {
+                                if (usedDet.Contains(pr.di) || usedPiece.Contains(pr.piece)) continue;
+                                usedDet.Add(pr.di); usedPiece.Add(pr.piece);
+                            }
                         }
                         if (usedDet.Count > 0)
                         {
@@ -844,7 +1591,8 @@ public class TangramMatcher : MonoBehaviour
                                     detectionWorldPosition = det.worldPosition,
                                     angleErrorDegrees = pr.a
                                 });
-                                linkSegments.Add((det.worldPosition, piece.position, pr.d, piece, det.shapeType, det.arucoId));
+                    linkSegments.Add((det.worldPosition, GetPieceCenterWorld(piece), pr.d, piece, det.shapeType, det.arucoId));
+                                lastAssignedPieceByKey[(det.shapeType, det.arucoId)] = piece;
                                 committed.Add(di); committedPieces.Add(piece);
                             }
                             // Move to next after committing this type group
@@ -892,21 +1640,138 @@ public class TangramMatcher : MonoBehaviour
                         if (d < nearestDet) { nearestDet = d; nearestIdx = nIdx; nearestPiece = np; }
                     }
                     if (nearestIdx < 0) continue; // no neighbor constraints available
+                    if (restrictRelationsToGraphEdges)
+                    {
+                        if (!diagramGraph.indexByTransform.TryGetValue(p, out int ip)) continue;
+                        if (!diagramGraph.indexByTransform.TryGetValue(nearestPiece, out int inb)) continue;
+                        if (!IsDiagramEdge(ip, inb)) continue; // enforce diagram adjacency
+                    }
 
                     Vector3 vDet = dg.nodes[nearestIdx].pos - node.pos;
-                    Vector3 vDiag = nearestPiece.position - p.position;
+                    Vector3 vDiag = GetPieceCenterWorld(nearestPiece) - GetPieceCenterWorld(p);
                     if (usePlanarProjectionForRelations)
                     {
-                        Vector3 nrm = tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up;
+                        Vector3 nrm = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
                         vDet = Vector3.ProjectOnPlane(vDet, nrm);
                         vDiag = Vector3.ProjectOnPlane(vDiag, nrm);
                     }
                     float scaleFactor = 1f;
                     if (useScaleNormalization && vDiag.magnitude > 1e-4f)
                         scaleFactor = vDet.magnitude / vDiag.magnitude;
-                    float avgDistDiff = Mathf.Abs(vDet.magnitude - vDiag.magnitude * scaleFactor);
-                    float avgAngDiff = ComputePlanarAngleBetweenVectors(vDet, vDiag);
+                    // Project to diagram plane for stable relation comparison
+                    Vector3 planeN = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
+                    Vector3 vDetP = Vector3.ProjectOnPlane(vDet, planeN);
+                    Vector3 vDiagP = Vector3.ProjectOnPlane(vDiag, planeN);
+                    float avgDistDiff = Mathf.Abs(vDetP.magnitude - vDiagP.magnitude * scaleFactor);
+                    if (useNormalizedRelationDistance)
+                    {
+                        if (useSubsetUnifiedBaseline)
+                        {
+                            if (cachedBaselineValid)
+                            {
+                                float ratioDet = vDetP.magnitude / Mathf.Max(1e-4f, cachedBaselineDetRef);
+                                float ratioDiag = (vDiagP.magnitude * scaleFactor) / Mathf.Max(1e-4f, cachedBaselineExpRef);
+                                avgDistDiff = Mathf.Abs(ratioDet - ratioDiag);
+                            }
+                            else
+                            {
+                                float detRef, expRef;
+                                if (!TryGetSubsetReferenceBaselines(dg, detToPiece, out detRef, out expRef))
+                                {
+                                    detRef = Mathf.Max(1e-4f, GetCurrentMatchedSubsetMaxDetectionEdgeDistance(dg, detToPiece));
+                                    expRef = Mathf.Max(1e-4f, GetCurrentMatchedSubsetMaxDiagramEdgeExpected(detToPiece));
+                                }
+                                float ratioDet = vDetP.magnitude / Mathf.Max(1e-4f, detRef);
+                                float ratioDiag = (vDiagP.magnitude * scaleFactor) / Mathf.Max(1e-4f, expRef);
+                                avgDistDiff = Mathf.Abs(ratioDet - ratioDiag);
+                            }
+                        }
+                        else
+                        {
+                            float baseline = Vector3.Distance(GetPieceCenterWorld(nearestPiece), GetPieceCenterWorld(p));
+                            if (baseline > 1e-4f)
+                            {
+                                float ratioDet = vDetP.magnitude / baseline;
+                                float ratioDiag = (vDiagP.magnitude * scaleFactor) / baseline;
+                                avgDistDiff = Mathf.Abs(ratioDet - ratioDiag);
+                            }
+                        }
+                    }
+                    float avgAngDiff = Mathf.Abs(Mathf.DeltaAngle(0f, Vector3.SignedAngle(vDetP.normalized, vDiagP.normalized, planeN)));
+                    if (avgDistDiff > relationMaxDistDiff || avgAngDiff > relationMaxAngleDiffDeg)
+                    {
+                        if (verboseRelationDebug)
+                        {
+                            nearMissList.Add((p, avgDistDiff, avgAngDiff, avgDistDiff + rotationWeightMetersPerDeg * avgAngDiff));
+                        }
+                        continue;
+                    }
+                    // Base relational cost from distance and relative-angle diff
                     float cost = avgDistDiff + rotationWeightMetersPerDeg * avgAngDiff;
+                    if (useAbsoluteDistanceInCost)
+                    {
+                        var detAbs = latestDetections[node.detIndex];
+                        float absDist0 = Vector3.Distance(detAbs.worldPosition, GetPieceCenterWorld(p));
+                        cost += absoluteDistanceWeightMeters * absDist0;
+                    }
+
+                    // Add absolute detection-to-piece center distance
+                    if (useAbsoluteDistanceInCost)
+                    {
+                        var detAbs = latestDetections[node.detIndex];
+                        float absDist0 = Vector3.Distance(detAbs.worldPosition, GetPieceCenterWorld(p));
+                        cost += absoluteDistanceWeightMeters * absDist0;
+                    }
+
+                    // Optional absolute orientation gating/cost using piece 'direction' child vs detection +X
+                    if (useAbsoluteOrientation)
+                    {
+                        var det = latestDetections[node.detIndex];
+                        Vector3 planeNCand = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
+                        Vector3 detDir = Vector3.ProjectOnPlane(det.worldRotation * Vector3.right, planeNCand).normalized;
+                        Vector3 pieceDir = Vector3.ProjectOnPlane(GetPieceDirectionVector(p), planeNCand).normalized;
+                        if (detDir.sqrMagnitude > 1e-6f && pieceDir.sqrMagnitude > 1e-6f)
+                        {
+                            float absOriDeg = Mathf.Abs(Vector3.SignedAngle(pieceDir, detDir, planeNCand));
+                            absOriDeg = NormalizeAngle180(absOriDeg);
+                            // Apply symmetry for type if helpful
+                            float mod = GetSymmetryModuloDegrees(node.type);
+                            if (mod > 0f)
+                            {
+                                absOriDeg = absOriDeg % mod;
+                                absOriDeg = Mathf.Min(absOriDeg, mod - absOriDeg);
+                            }
+                            if (absOriDeg > absoluteOrientationToleranceDeg)
+                            {
+                                // Reject candidate if outside tolerance
+                                if (debugLogOrientationRejections)
+                                {
+                                    Debug.Log($"[TangramMatcher] ORI REJECT det({node.type}:{latestDetections[node.detIndex].arucoId}) -> diag({p.name}) | absOri={absOriDeg:F1}° > tol={absoluteOrientationToleranceDeg:F1}°");
+                                }
+                                continue;
+                            }
+                            if (debugLogOrientationDiff)
+                            {
+                                Debug.Log($"[TangramMatcher] ORI diff det({node.type}:{latestDetections[node.detIndex].arucoId}) -> diag({p.name}) | absOri={absOriDeg:F1}°");
+                            }
+                            cost += absoluteOrientationWeightMetersPerDeg * absOriDeg;
+                        }
+                    }
+                    if (preferPreviousAssignment)
+                    {
+                        var key = (node.type, latestDetections[node.detIndex].arucoId);
+                        if (lastAssignedPieceByKey.TryGetValue(key, out var prev) && prev == p)
+                        {
+                            cost = Mathf.Max(0f, cost - previousAssignmentBiasMeters);
+                        }
+                        else if (lastAssignedPieceByKey.TryGetValue(key, out var prevPiece) && prevPiece != null)
+                        {
+                            if (lockedByPiece.TryGetValue(prevPiece, out var ls) && frameCounter - ls.lastSeenFrame <= assignmentCooldownFrames)
+                            {
+                                cost += cooldownPenaltyMeters;
+                            }
+                        }
+                    }
                     bool passes = avgDistDiff <= graphDistanceToleranceMeters && avgAngDiff <= graphAngleToleranceDeg;
                     if (passes)
                     {
@@ -936,7 +1801,7 @@ public class TangramMatcher : MonoBehaviour
                     for (int ii = 0; ii < take; ii++)
                     {
                         var nm = nearMissList[ii];
-                        Debug.Log($"[TangramMatcher] near-miss for det({node.type}) -> diag({nm.p.name}) avg diff(d)={nm.avgDistDiff:F3}m avg diff(θ)={nm.avgAngDiff:F1} deg | tol(d)<={graphDistanceToleranceMeters:F3} tol(θ)<={graphAngleToleranceDeg:F1}");
+                        Debug.Log($"[TangramMatcher] near-miss for det({node.type}) -> diag({nm.p.name}) avg diff(d)={nm.avgDistDiff:F3}m avg diff(deg)={nm.avgAngDiff:F1} deg | tol(d)<={graphDistanceToleranceMeters:F3} tol(deg)<={graphAngleToleranceDeg:F1}");
                         if (debugDrawNearMissLines)
                         {
                             // Draw line from detection to candidate piece center with near-miss color and use distance diff for segment magnitude coloring elsewhere if needed
@@ -953,30 +1818,96 @@ public class TangramMatcher : MonoBehaviour
                 remainingByType[node.type].Remove(chosen);
                 matchedPieceSet.Add(chosen);
                 var det = latestDetections[node.detIndex];
+                // Report absolute distance/angle to reduce confusion in logs
+                float absDist = Vector3.Distance(det.worldPosition, GetPieceCenterWorld(chosen));
+                float absAng = ComputeAngleError(det.shapeType, det.worldRotation, chosen);
                 lastMatchResults.Add(new MatchResult
                 {
                     shapeType = det.shapeType,
                     arucoId = det.arucoId,
                     matchedPieceTransform = chosen,
-                    worldDistanceMeters = chosenAvgDistDiff,
+                    worldDistanceMeters = absDist,
                     detectionWorldPosition = det.worldPosition,
-                    angleErrorDegrees = chosenAvgAngDiff
+                    angleErrorDegrees = absAng
                 });
                 linkSegments.Add((det.worldPosition, chosen.position, chosenAvgDistDiff, chosen, det.shapeType, det.arucoId));
+                lastAssignedPieceByKey[(det.shapeType, det.arucoId)] = chosen;
 
-                // Detailed relational debug per matched neighbor
+            // Detailed relational debug per matched neighbor (only diagram edges if restricted)
                 foreach (int nIdx in node.neighbors)
                 {
                     if (!detToPiece.TryGetValue(nIdx, out var neighborPiece))
                         continue;
+                if (restrictRelationsToGraphEdges)
+                {
+                    if (!diagramGraph.indexByTransform.TryGetValue(chosen, out int di)) continue;
+                    if (!diagramGraph.indexByTransform.TryGetValue(neighborPiece, out int dj)) continue;
+                    if (!IsDiagramEdge(di, dj)) continue;
+                }
                     Vector3 vDet = node.pos - dg.nodes[nIdx].pos;
-                    Vector3 vDiag = chosen.position - neighborPiece.position;
-                    float distDiff = Mathf.Abs(vDet.magnitude - vDiag.magnitude);
-                    float angDiff = ComputePlanarAngleBetweenVectors(vDet, vDiag);
-                    Debug.Log($"[TangramMatcher] matched relation det({node.type})-det({dg.nodes[nIdx].type}) vs diag({chosen.name})-diag({neighborPiece.name}) diff(d)={distDiff:F3}m diff(θ)={angDiff:F1} deg");
+                    Vector3 vDiag = GetPieceCenterWorld(chosen) - GetPieceCenterWorld(neighborPiece);
+                // Project to diagram plane for stable angle
+                Vector3 planeN = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
+                Vector3 vDetP = Vector3.ProjectOnPlane(vDet, planeN);
+                Vector3 vDiagP = Vector3.ProjectOnPlane(vDiag, planeN);
+                float distDiff = Mathf.Abs(vDetP.magnitude - vDiagP.magnitude);
+                float angDiff = Mathf.Abs(Mathf.DeltaAngle(0f, Vector3.SignedAngle(vDetP.normalized, vDiagP.normalized, planeN)));
+                if (distDiff <= relationMaxDistDiff && angDiff <= relationMaxAngleDiffDeg)
+                {
+                    Debug.Log($"[TangramMatcher] MATCH relation det({node.type})-det({dg.nodes[nIdx].type}) vs diag({chosen.name})-diag({neighborPiece.name}) diff(d)={distDiff:F3}m diff(deg)={angDiff:F1} deg");
+                }
+                else if (verboseRelationDebug)
+                {
+                    Debug.Log($"[TangramMatcher] CAND relation (REJECT) det({node.type})-det({dg.nodes[nIdx].type}) vs diag({chosen.name})-diag({neighborPiece.name}) diff(d)={distDiff:F3}m diff(deg)={angDiff:F1} deg");
+                }
                 }
 
                 if (!seeded) seeded = true;
+            }
+        }
+
+        if (enableStatefulMatching)
+        {
+            // Update locked confidences
+            var seenPieces = new HashSet<Transform>();
+            foreach (var r in lastMatchResults) seenPieces.Add(r.matchedPieceTransform);
+            // Decay and update
+            foreach (var kv in lockedByPiece)
+            {
+                var ls = kv.Value;
+                if (seenPieces.Contains(ls.piece))
+                {
+                    ls.confidence = Mathf.Clamp01(ls.confidence + confidenceGainPerHit);
+                    var last = ls.lastPosition;
+                    var current = GetPieceCenterWorld(ls.piece);
+                    ls.lastVelocity = (current - last) / Mathf.Max(Time.deltaTime, 1e-3f);
+                    ls.lastPosition = current;
+                    ls.lastSeenFrame = frameCounter;
+                    if (ls.confidence >= lockConfidenceThreshold) ls.isLocked = true;
+                }
+                else
+                {
+                    ls.confidence = Mathf.Clamp01(ls.confidence - confidenceDecayPerFrame);
+                    if (ls.confidence <= unlockConfidenceThreshold) ls.isLocked = false;
+                }
+            }
+            // Initialize states for newly matched pieces
+            foreach (var r in lastMatchResults)
+            {
+                if (!lockedByPiece.TryGetValue(r.matchedPieceTransform, out var ls))
+                {
+                    ls = new LockedState
+                    {
+                        piece = r.matchedPieceTransform,
+                        type = r.shapeType,
+                        confidence = confidenceGainPerHit,
+                        lastPosition = r.matchedPieceTransform.position,
+                        lastVelocity = Vector3.zero,
+                        lastSeenFrame = frameCounter,
+                        isLocked = confidenceGainPerHit >= lockConfidenceThreshold
+                    };
+                    lockedByPiece[r.matchedPieceTransform] = ls;
+                }
             }
         }
     }
@@ -1013,6 +1944,7 @@ public class TangramMatcher : MonoBehaviour
         for (int i = 0; i < latestDetections.Count; i++)
         {
             var d = latestDetections[i];
+            if (d.isCorner) continue; // exclude plane corner markers from detection graph
             dg.nodes.Add(new DetectionGraph.DNode
             {
                 detIndex = i,
@@ -1062,6 +1994,168 @@ public class TangramMatcher : MonoBehaviour
         }
     }
 
+    // ★ REPLACE ★: Proper Hungarian algorithm (O(n^3)), rectangular cost allowed.
+    private static int[] HungarianSolve(float[,] cost)
+    {
+        int nRows = cost.GetLength(0);
+        int nCols = cost.GetLength(1);
+        int n = Math.Max(nRows, nCols);
+
+        // Build square matrix
+        float[,] a = new float[n, n];
+        for (int r = 0; r < n; r++)
+            for (int c = 0; c < n; c++)
+                a[r, c] = (r < nRows && c < nCols) ? cost[r, c] : 1e6f;
+
+        // Row reduction
+        for (int r = 0; r < n; r++)
+        {
+            float min = float.PositiveInfinity;
+            for (int c = 0; c < n; c++) if (a[r, c] < min) min = a[r, c];
+            if (!float.IsInfinity(min))
+                for (int c = 0; c < n; c++) a[r, c] -= min;
+        }
+        // Column reduction
+        for (int c = 0; c < n; c++)
+        {
+            float min = float.PositiveInfinity;
+            for (int r = 0; r < n; r++) if (a[r, c] < min) min = a[r, c];
+            if (!float.IsInfinity(min))
+                for (int r = 0; r < n; r++) a[r, c] -= min;
+        }
+
+        // Marks
+        int[] rowCover = new int[n];
+        int[] colCover = new int[n];
+        int[,] star = new int[n, n];
+        int[,] prime = new int[n, n];
+
+        // Star zeros greedily
+        for (int r = 0; r < n; r++)
+        {
+            for (int c = 0; c < n; c++)
+            {
+                if (Mathf.Approximately(a[r, c], 0f) && rowCover[r] == 0 && colCover[c] == 0)
+                {
+                    star[r, c] = 1;
+                    rowCover[r] = 1;
+                    colCover[c] = 1;
+                }
+            }
+        }
+        Array.Clear(rowCover, 0, n);
+        Array.Clear(colCover, 0, n);
+
+        // Cover columns of starred zeros
+        for (int c = 0; c < n; c++)
+            for (int r = 0; r < n; r++)
+                if (star[r, c] == 1) { colCover[c] = 1; break; }
+
+        while (true)
+        {
+            int coveredCols = 0;
+            for (int c = 0; c < n; c++) if (colCover[c] == 1) coveredCols++;
+            if (coveredCols >= n) break; // optimal
+
+            // Step: find a noncovered zero, prime it. If no star in its row, augment.
+            bool found = true;
+            int zRow = -1, zCol = -1;
+            while (found)
+            {
+                found = false;
+                for (int r = 0; r < n && !found; r++)
+                {
+                    if (rowCover[r] == 1) continue;
+                    for (int c = 0; c < n; c++)
+                    {
+                        if (colCover[c] == 0 && Mathf.Approximately(a[r, c], 0f) && prime[r, c] == 0)
+                        {
+                            prime[r, c] = 1;
+                            int starCol = -1;
+                            for (int cc = 0; cc < n; cc++) if (star[r, cc] == 1) { starCol = cc; break; }
+                            if (starCol >= 0)
+                            {
+                                rowCover[r] = 1;
+                                colCover[starCol] = 0;
+                            }
+                            else
+                            {
+                                zRow = r; zCol = c;
+                                found = false; // break both
+                                goto AUGMENT;
+                            }
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+
+                // No uncovered zero found → adjust matrix
+                float min = float.PositiveInfinity;
+                for (int r = 0; r < n; r++)
+                    if (rowCover[r] == 0)
+                        for (int c = 0; c < n; c++)
+                            if (colCover[c] == 0 && a[r, c] < min) min = a[r, c];
+
+                for (int r = 0; r < n; r++)
+                {
+                    for (int c = 0; c < n; c++)
+                    {
+                        if (rowCover[r] == 1) a[r, c] += min;
+                        if (colCover[c] == 0) a[r, c] -= min;
+                    }
+                }
+            }
+
+AUGMENT:
+            // Build alternating path from (zRow,zCol)
+            var path = new List<Vector2Int>();
+            path.Add(new Vector2Int(zRow, zCol));
+            while (true)
+            {
+                int r = path[path.Count - 1].x;
+                int c = path[path.Count - 1].y;
+
+                int starRow = -1;
+                for (int rr = 0; rr < n; rr++) if (star[rr, c] == 1) { starRow = rr; break; }
+                if (starRow < 0) break;
+                path.Add(new Vector2Int(starRow, c));
+
+                int primeCol = -1;
+                for (int cc = 0; cc < n; cc++) if (prime[starRow, cc] == 1) { primeCol = cc; break; }
+                path.Add(new Vector2Int(starRow, primeCol));
+            }
+
+            // Star ↔ prime toggle along the path
+            foreach (var pos in path)
+            {
+                int r = pos.x, c = pos.y;
+                if (star[r, c] == 1) star[r, c] = 0;
+                else if (prime[r, c] == 1) { star[r, c] = 1; prime[r, c] = 0; }
+            }
+            // Clear covers and primes
+            Array.Clear(rowCover, 0, n);
+            Array.Clear(colCover, 0, n);
+            Array.Clear(prime, 0, prime.Length);
+
+            // Cover columns with stars again
+            for (int c = 0; c < n; c++)
+                for (int r = 0; r < n; r++)
+                    if (star[r, c] == 1) { colCover[c] = 1; break; }
+        }
+
+        // Build assignment for original rect
+        int[] assign = new int[nRows];
+        for (int r = 0; r < nRows; r++)
+        {
+            int cAssigned = -1;
+            for (int c = 0; c < nCols; c++)
+                if (star[r, c] == 1) { cAssigned = c; break; }
+            assign[r] = cAssigned;
+        }
+        return assign;
+    }
+
     private bool TryComputeRelationalCostForCandidate(int nodeIdx, Transform candidatePiece, DetectionGraph dg, Dictionary<int, Transform> detToPiece,
         out float avgDistDiff, out float avgAngDiff, out float usedScale, out int usedCount)
     {
@@ -1072,7 +2166,7 @@ public class TangramMatcher : MonoBehaviour
         {
             if (!detToPiece.TryGetValue(nIdx, out var neighborPiece)) continue;
             Vector3 vDet = dg.nodes[nIdx].pos - center.pos;
-            Vector3 vDiag = neighborPiece.position - candidatePiece.position;
+            Vector3 vDiag = GetPieceCenterWorld(neighborPiece) - GetPieceCenterWorld(candidatePiece);
             if (usePlanarProjectionForRelations)
             {
                 Vector3 nrm = tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up;
@@ -1095,7 +2189,7 @@ public class TangramMatcher : MonoBehaviour
             {
                 if (!detToPiece.TryGetValue(nIdx, out var neighborPiece)) continue;
                 Vector3 vDet = dg.nodes[nIdx].pos - center.pos;
-                Vector3 vDiag = neighborPiece.position - candidatePiece.position;
+                Vector3 vDiag = GetPieceCenterWorld(neighborPiece) - GetPieceCenterWorld(candidatePiece);
                 if (usePlanarProjectionForRelations)
                 {
                     Vector3 nrm = tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up;
@@ -1125,15 +2219,33 @@ public class TangramMatcher : MonoBehaviour
     private float ComputePlanarAngleDeg(Vector3 from, Vector3 to)
     {
         Vector3 dir = to - from;
-        Vector3 planeNormal = tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up;
+        Vector3 planeNormal = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
         Vector3 dirProj = Vector3.ProjectOnPlane(dir, planeNormal);
         if (dirProj.sqrMagnitude < 1e-6f) return 0f;
         dirProj.Normalize();
-        // Compute angle relative to diagram forward projected onto plane
-        Vector3 refForward = tangramDiagramRoot != null ? Vector3.ProjectOnPlane(tangramDiagramRoot.forward, planeNormal).normalized : Vector3.forward;
-        if (refForward.sqrMagnitude < 1e-6f) refForward = Vector3.forward;
+        // Compute angle relative to fixed X axis on the plane for stability
+        Vector3 refForward = Vector3.ProjectOnPlane(Vector3.right, planeNormal).normalized;
+        if (refForward.sqrMagnitude < 1e-6f) refForward = Vector3.right;
         float ang = Vector3.SignedAngle(refForward, dirProj, planeNormal);
         return NormalizeAngle180(ang);
+    }
+
+    private Vector3 GetPieceCenterWorld(Transform piece)
+    {
+        if (piece == null) return Vector3.zero;
+        var mf = piece.GetComponent<MeshFilter>();
+        // Prefer an explicit child named "center" if present
+        var centerChild = piece.Find("center");
+        if (centerChild != null)
+            return centerChild.position;
+        if (mf != null && mf.sharedMesh != null)
+        {
+            var bounds = mf.sharedMesh.bounds; // local-space bounds
+            Vector3 localCenter = bounds.center;
+            return piece.TransformPoint(localCenter);
+        }
+        // Fallback to transform.position
+        return piece.position;
     }
 
     private float ComputePlanarAngleBetweenVectors(Vector3 vA, Vector3 vB)
@@ -1168,6 +2280,110 @@ public class TangramMatcher : MonoBehaviour
         }
         if (cnt == 0) return 0f;
         return sum / cnt;
+    }
+
+    private Vector3 KalmanPredict(LockedState ls, float dt)
+    {
+        // Simple per-axis constant-velocity Kalman
+        if (!ls.kalmanInitialized)
+        {
+            ls.kPos = ls.lastPosition;
+            ls.kVel = ls.lastVelocity;
+            ls.kCovX = new Vector4(1, 0, 0, 1);
+            ls.kCovY = new Vector4(1, 0, 0, 1);
+            ls.kCovZ = new Vector4(1, 0, 0, 1);
+            ls.kalmanInitialized = true;
+        }
+        float q = kalmanProcessNoise;
+        // Predict per axis: x
+        PredictAxis(ref ls.kPos.x, ref ls.kVel.x, ref ls.kCovX, dt, q);
+        PredictAxis(ref ls.kPos.y, ref ls.kVel.y, ref ls.kCovY, dt, q);
+        PredictAxis(ref ls.kPos.z, ref ls.kVel.z, ref ls.kCovZ, dt, q);
+        return ls.kPos;
+    }
+
+    private void KalmanUpdate(LockedState ls, Vector3 meas)
+    {
+        float r = kalmanMeasurementNoise;
+        UpdateAxis(ref ls.kPos.x, ref ls.kVel.x, ref ls.kCovX, meas.x, r);
+        UpdateAxis(ref ls.kPos.y, ref ls.kVel.y, ref ls.kCovY, meas.y, r);
+        UpdateAxis(ref ls.kPos.z, ref ls.kVel.z, ref ls.kCovZ, meas.z, r);
+        ls.lastPosition = ls.kPos;
+        ls.lastVelocity = ls.kVel;
+    }
+
+    // ★ ADD ★: Mahalanobis distance^2 from predicted position to measurement z.
+    // Uses per-axis position covariance p11 from Kalman (ls.kCov* .x).
+    private float MahalanobisDistanceSquared(LockedState ls, Vector3 z, bool planar)
+    {
+        // Predict (do not mutate) — we already call real Predict/Update elsewhere.
+        Vector3 pred = useKalmanPrediction
+            ? KalmanPredict(ls, Time.deltaTime)
+            : (ls.lastPosition + ls.lastVelocity * Time.deltaTime);
+
+        if (gatingPlanar || planar)
+        {
+            Vector3 nrm = tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up;
+            Vector3 zp = Vector3.ProjectOnPlane(z, nrm);
+            Vector3 pp = Vector3.ProjectOnPlane(pred, nrm);
+            float dx = zp.x - pp.x;
+            float dz = zp.z - pp.z;
+
+            // position variance ~ p11 of each axis filter
+            float varX = Mathf.Max(ls.kCovX.x, 1e-6f);
+            float varZ = Mathf.Max(ls.kCovZ.x, 1e-6f);
+
+            return (dx * dx) / varX + (dz * dz) / varZ;
+        }
+        else
+        {
+            float dx = z.x - pred.x;
+            float dy = z.y - pred.y;
+            float dz = z.z - pred.z;
+
+            float varX = Mathf.Max(ls.kCovX.x, 1e-6f);
+            float varY = Mathf.Max(ls.kCovY.x, 1e-6f);
+            float varZ = Mathf.Max(ls.kCovZ.x, 1e-6f);
+
+            return (dx * dx) / varX + (dy * dy) / varY + (dz * dz) / varZ;
+        }
+    }
+
+    private void PredictAxis(ref float pos, ref float vel, ref Vector4 cov, float dt, float q)
+    {
+        // State transition: [1 dt; 0 1]
+        pos = pos + vel * dt;
+        // Covariance prediction: P = F P F^T + Q
+        float p11 = cov.x, p12 = cov.y, p21 = cov.z, p22 = cov.w;
+        float f11 = 1f, f12 = dt, f21 = 0f, f22 = 1f;
+        float n11 = f11 * p11 + f12 * p21;
+        float n12 = f11 * p12 + f12 * p22;
+        float n21 = f21 * p11 + f22 * p21;
+        float n22 = f21 * p12 + f22 * p22;
+        // P = N * F^T + Q
+        float p11p = n11 * f11 + n12 * f12 + q;
+        float p12p = n11 * f21 + n12 * f22;
+        float p21p = n21 * f11 + n22 * f12;
+        float p22p = n21 * f21 + n22 * f22 + q;
+        cov = new Vector4(p11p, p12p, p21p, p22p);
+    }
+
+    private void UpdateAxis(ref float pos, ref float vel, ref Vector4 cov, float z, float r)
+    {
+        // Measurement H = [1 0], innovation y = z - pos
+        float p11 = cov.x, p12 = cov.y, p21 = cov.z, p22 = cov.w;
+        float s = p11 + r;
+        float k1 = p11 / s;
+        float k2 = p21 / s;
+        float y = z - pos;
+        pos = pos + k1 * y;
+        vel = vel + k2 * y;
+        // Covariance update: (I - K H) P
+        float p11n = (1 - k1) * p11;
+        float p12n = (1 - k1) * p12;
+        float p21n = -k2 * p11 + p21;
+        float p22n = -k2 * p12 + p22;
+        cov = new Vector4(p11n, p12n, p21n, p22n);
     }
 
     private void DebugLogDiagramGraph()
@@ -1290,12 +2506,30 @@ public class TangramMatcher : MonoBehaviour
 
     void OnGUI()
     {
-        if (!showErrorLabelsUI)
-            return;
+        if (showMissingCornersUI && requirePlaneCorners && !planeCornersReady)
+        {
         var cam = uiCamera != null ? uiCamera : Camera.main;
         if (cam == null) cam = Camera.current;
         if (cam == null && Camera.allCamerasCount > 0) cam = Camera.allCameras[0];
-        if (cam == null) return;
+            if (cam != null)
+            {
+                if (cachedLabelStyle == null)
+                {
+                    cachedLabelStyle = new GUIStyle(GUI.skin.label)
+                    {
+                        fontSize = uiFontSize,
+                        normal = { textColor = Color.yellow }
+                    };
+                }
+                GUI.Label(new Rect(20f, 20f, 600f, 24f), "Corner markers not detected – matching paused", cachedLabelStyle);
+            }
+        }
+        if (!showErrorLabelsUI && !showDetectionEulerUI)
+            return;
+        var cam2 = uiCamera != null ? uiCamera : Camera.main;
+        if (cam2 == null) cam2 = Camera.current;
+        if (cam2 == null && Camera.allCamerasCount > 0) cam2 = Camera.allCameras[0];
+        if (cam2 == null) return;
         if (cachedLabelStyle == null)
         {
             cachedLabelStyle = new GUIStyle(GUI.skin.label)
@@ -1310,21 +2544,116 @@ public class TangramMatcher : MonoBehaviour
             cachedLabelStyle.normal.textColor = uiLabelColor;
         }
 
-        foreach (var res in lastMatchResults)
+        if (showErrorLabelsUI)
         {
-            Vector3 world = res.matchedPieceTransform.position;
-            Vector3 sp = cam.WorldToScreenPoint(world);
-            if (sp.z < 0f) continue; // behind camera
-            float x = sp.x;
-            float y = Screen.height - sp.y;
-            string text = $"{res.shapeType}: {res.worldDistanceMeters:F2}m, {res.angleErrorDegrees:F0}°";
-            GUI.Label(new Rect(x + 6f, y - 18f, 260f, 22f), text, cachedLabelStyle);
+            foreach (var res in lastMatchResults)
+            {
+                Vector3 world = GetPieceCenterWorld(res.matchedPieceTransform);
+                Vector3 sp = cam2.WorldToScreenPoint(world);
+                if (sp.z < 0f) continue; // behind camera
+                float x = sp.x;
+                float y = Screen.height - sp.y;
+                string text = $"{res.shapeType}: {res.worldDistanceMeters:F2}m, {res.angleErrorDegrees:F0}°";
+                GUI.Label(new Rect(x + 6f, y - 18f, 260f, 22f), text, cachedLabelStyle);
+            }
+        }
+
+        if (showDetectionEulerUI)
+        {
+            // Show Euler angles (XYZ in degrees) for each current detection (non-corner)
+            for (int i = 0; i < latestDetections.Count; i++)
+            {
+                var d = latestDetections[i];
+                if (d.isCorner) continue;
+                Vector3 sp = cam2.WorldToScreenPoint(d.worldPosition);
+                if (sp.z < 0f) continue;
+                float x = sp.x;
+                float y = Screen.height - sp.y;
+                Vector3 e = d.worldRotation.eulerAngles;
+                string text = $"ID {d.arucoId} ({d.shapeType})  Euler XYZ: {e.x:F0}°, {e.y:F0}°, {e.z:F0}°";
+                GUI.Label(new Rect(x + 6f, y + 4f, 380f, 22f), text, cachedLabelStyle);
+            }
         }
     }
 
     private static bool HasRenderableMesh(GameObject go)
     {
         return go != null && go.GetComponent<MeshFilter>() != null && go.GetComponent<MeshRenderer>() != null;
+    }
+
+    private LineRenderer GetOrCreateOrientationArrow(int arucoId)
+    {
+        if (!orientationArrowById.TryGetValue(arucoId, out var lr) || lr == null)
+        {
+            var go = new GameObject($"MarkerArrow_{arucoId}");
+            go.transform.SetParent(transform, false);
+            lr = go.AddComponent<LineRenderer>();
+            lr.useWorldSpace = true;
+            lr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+            lr.receiveShadows = false;
+            lr.numCapVertices = 0;
+            lr.numCornerVertices = 0;
+            lr.positionCount = 2;
+            lr.material = new Material(Shader.Find("Sprites/Default"));
+            lr.startColor = detectionOrientationArrowColor;
+            lr.endColor = detectionOrientationArrowColor;
+            lr.startWidth = detectionOrientationArrowWidth;
+            lr.endWidth = detectionOrientationArrowWidth;
+            orientationArrowById[arucoId] = lr;
+        }
+        // Keep style up to date from inspector
+        lr.startColor = detectionOrientationArrowColor;
+        lr.endColor = detectionOrientationArrowColor;
+        lr.startWidth = detectionOrientationArrowWidth;
+        lr.endWidth = detectionOrientationArrowWidth;
+        return lr;
+    }
+
+    private void UpdateDetectionOrientationArrows()
+    {
+        // Disable all if toggle off
+        if (!drawDetectionOrientationArrows)
+        {
+            foreach (var kv in orientationArrowById)
+            {
+                if (kv.Value != null) kv.Value.enabled = false;
+            }
+            return;
+        }
+        // Determine plane normal to project onto
+        Vector3 planeN = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
+        var alive = new HashSet<int>();
+        for (int i = 0; i < latestDetections.Count; i++)
+        {
+            var d = latestDetections[i];
+            if (d.isCorner) continue;
+            alive.Add(d.arucoId);
+            var lr = GetOrCreateOrientationArrow(d.arucoId);
+            Vector3 pos = d.worldPosition;
+            // Use marker's local +X direction projected onto the plane
+            Vector3 dir = d.worldRotation * Vector3.right;
+            Vector3 dirProj = Vector3.ProjectOnPlane(dir, planeN);
+            if (dirProj.sqrMagnitude < 1e-8f)
+            {
+                // Fallback to +Z if +X is nearly parallel to normal
+                dirProj = Vector3.ProjectOnPlane(d.worldRotation * Vector3.forward, planeN);
+            }
+            dirProj = dirProj.normalized * detectionOrientationArrowLength;
+            lr.SetPosition(0, pos);
+            lr.SetPosition(1, pos + dirProj);
+            lr.enabled = true;
+        }
+        // Disable arrows for ids not alive this frame
+        var toDisable = new List<int>();
+        foreach (var kv in orientationArrowById)
+        {
+            if (!alive.Contains(kv.Key) && kv.Value != null)
+            {
+                kv.Value.enabled = false;
+                toDisable.Add(kv.Key);
+            }
+        }
+        // Optionally keep instances for reuse; we only disable.
     }
 
     private static bool TryInferShapeTypeFromName(string objectName, out TangramShapeType shapeType)
@@ -1419,11 +2748,15 @@ public class TangramMatcher : MonoBehaviour
 
         // Use diagram up as plane normal; fallback to world up
         Vector3 planeNormal = tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up;
-        // Compare planar orientation using projected forward vectors
-        Vector3 detForward = detectionWorldRotation * Vector3.forward;
-        Vector3 pieceForward = piece.rotation * Vector3.forward;
-        Vector3 detProj = Vector3.ProjectOnPlane(detForward, planeNormal).normalized;
-        Vector3 pieceProj = Vector3.ProjectOnPlane(pieceForward, planeNormal).normalized;
+
+        // Compute detection direction: by convention use local +X of the ArUco marker
+        Vector3 detDir = detectionWorldRotation * Vector3.right;
+        Vector3 detProj = Vector3.ProjectOnPlane(detDir, planeNormal).normalized;
+
+        // Compute piece direction from 'center' -> 'direction' child if present; fallback to piece forward
+        Vector3 pieceDir = GetPieceDirectionVector(piece);
+        Vector3 pieceProj = Vector3.ProjectOnPlane(pieceDir, planeNormal).normalized;
+
         if (detProj.sqrMagnitude < 1e-6f || pieceProj.sqrMagnitude < 1e-6f)
             return 0f;
 
@@ -1438,13 +2771,33 @@ public class TangramMatcher : MonoBehaviour
             rawAngle = Mathf.Min(rawAngle, symmetry - rawAngle);
         }
 
-        // Mirror-insensitive for parallelogram
-        if (type == TangramShapeType.Parallelogram)
+        // Mirror-insensitive for parallelogram only when absolute orientation is not enforced
+        if (!useAbsoluteOrientation && type == TangramShapeType.Parallelogram)
         {
             rawAngle = Mathf.Min(rawAngle, Mathf.Abs(180f - rawAngle));
         }
 
         return Mathf.Abs(rawAngle);
+    }
+
+    /// <summary>
+    /// Returns a world-space direction vector for a diagram piece.
+    /// Prefers child objects named 'center' and 'direction', using (direction.position - center.position).
+    /// Falls back to the piece's forward vector if children are missing or degenerate.
+    /// </summary>
+    private Vector3 GetPieceDirectionVector(Transform piece)
+    {
+        if (piece == null) return Vector3.forward;
+        Transform center = piece.Find("center");
+        Transform dir = piece.Find("direction");
+        if (center != null && dir != null)
+        {
+            Vector3 v = dir.position - center.position;
+            if (v.sqrMagnitude > 1e-8f)
+                return v.normalized;
+        }
+        // Fallback: use the transform's forward
+        return piece.forward;
     }
 
     private static float NormalizeAngle180(float deg)
@@ -1465,7 +2818,7 @@ public class TangramMatcher : MonoBehaviour
             case TangramShapeType.LargeTriangle:
             case TangramShapeType.MediumTriangle:
             case TangramShapeType.SmallTriangle:
-                return 90f; // Right isosceles tangram triangles
+                return 0f; // Triangles have no rotational symmetry (orientation is unique)
             default:
                 return 0f;
         }
@@ -1488,13 +2841,615 @@ public class TangramMatcher : MonoBehaviour
         {
             var e = node.edges[k];
             var neigh = diagramGraph.nodes[e.toIndex].piece;
-            float actualDist = Vector3.Distance(node.piece.position, neigh.position);
-            float actualAng = ComputePlanarAngleDeg(node.piece.position, neigh.position);
+            float actualDist = Vector3.Distance(GetPieceCenterWorld(node.piece), GetPieceCenterWorld(neigh));
+            float actualAng = ComputePlanarAngleDeg(GetPieceCenterWorld(node.piece), GetPieceCenterWorld(neigh));
             float dDiff = Mathf.Abs(actualDist - e.expectedDistanceMeters);
             float aDiff = Mathf.Abs(NormalizeAngle180(actualAng - e.expectedAngleDeg));
-            parts.Add($"-> '{neigh.name}' diff(d)={dDiff:F2}m diff(θ)={aDiff:F0}°");
+            parts.Add($"-> '{neigh.name}' diff(d)={dDiff:F2}m diff(deg)={aDiff:F0}°");
         }
         return string.Join(", ", parts);
+    }
+
+    private void UpdatePlaneCornersFromDetections()
+    {
+        planeCornersReady = false;
+        bool hasTL = false, hasTR = false, hasBR = false, hasBL = false;
+        foreach (var d in latestDetections)
+        {
+            if (d.arucoId == planeCornerIdTL) { hasTL = true; planeTLWorld = d.worldPosition; }
+            else if (d.arucoId == planeCornerIdTR) { hasTR = true; planeTRWorld = d.worldPosition; }
+            else if (d.arucoId == planeCornerIdBR) { hasBR = true; planeBRWorld = d.worldPosition; }
+            else if (d.arucoId == planeCornerIdBL) { hasBL = true; planeBLWorld = d.worldPosition; }
+        }
+        planeCornersReady = hasTL && hasTR && hasBR && hasBL;
+        if (planeCornersReady) planeCornersFrame = frameCounter;
+    }
+
+    private List<DetectedShape> FuseBufferedDetections()
+    {
+        // Median fuse positions over buffer window per (type, id)
+        var posX = new Dictionary<(TangramShapeType type, int id), List<float>>();
+        var posY = new Dictionary<(TangramShapeType type, int id), List<float>>();
+        var posZ = new Dictionary<(TangramShapeType type, int id), List<float>>();
+        var latestSample = new Dictionary<(TangramShapeType type, int id), DetectedShape>();
+        var latestFrame = new Dictionary<(TangramShapeType type, int id), int>();
+        foreach (var tuple in recentDetectionsBuffer)
+        {
+            int f = tuple.frame;
+            foreach (var d in tuple.items)
+            {
+                var key = (d.shapeType, d.arucoId);
+                if (!posX.TryGetValue(key, out var lx)) { lx = new List<float>(); posX[key] = lx; }
+                if (!posY.TryGetValue(key, out var ly)) { ly = new List<float>(); posY[key] = ly; }
+                if (!posZ.TryGetValue(key, out var lz)) { lz = new List<float>(); posZ[key] = lz; }
+                lx.Add(d.worldPosition.x);
+                ly.Add(d.worldPosition.y);
+                lz.Add(d.worldPosition.z);
+                if (!latestFrame.TryGetValue(key, out var lf) || f >= lf)
+                {
+                    latestFrame[key] = f;
+                    latestSample[key] = d; // keep latest rotation/confidence
+                }
+            }
+        }
+        float MedianOf(List<float> vals)
+        {
+            vals.Sort();
+            int n = vals.Count;
+            if (n == 0) return 0f;
+            if ((n & 1) == 1) return vals[n / 2];
+            return 0.5f * (vals[n / 2 - 1] + vals[n / 2]);
+        }
+        var fused = new List<DetectedShape>();
+        foreach (var kv in latestSample)
+        {
+            var key = kv.Key;
+            var baseDet = kv.Value;
+            var lx = posX[key]; var ly = posY[key]; var lz = posZ[key];
+            Vector3 med = new Vector3(MedianOf(lx), MedianOf(ly), MedianOf(lz));
+            baseDet.worldPosition = med;
+            fused.Add(baseDet);
+        }
+        return fused;
+    }
+
+    private void UpdatePlaneCornersFromList(List<DetectedShape> list)
+    {
+        planeCornersReady = false;
+        bool hasTL = false, hasTR = false, hasBR = false, hasBL = false;
+        foreach (var d in list)
+        {
+            if (d.arucoId == planeCornerIdTL) { hasTL = true; planeTLWorld = d.worldPosition; }
+            else if (d.arucoId == planeCornerIdTR) { hasTR = true; planeTRWorld = d.worldPosition; }
+            else if (d.arucoId == planeCornerIdBR) { hasBR = true; planeBRWorld = d.worldPosition; }
+            else if (d.arucoId == planeCornerIdBL) { hasBL = true; planeBLWorld = d.worldPosition; }
+        }
+        // Fallback: also look into the recentCornerBuffer if any missing
+        if (!(hasTL && hasTR && hasBR && hasBL) && recentCornerBuffer.Count > 0)
+        {
+            var merged = new Dictionary<int, List<float>>(); // xTL,yTL,zTL,xTR,... (we'll do simple last value)
+            foreach (var tuple in recentCornerBuffer)
+            {
+                foreach (var kv in tuple.corners)
+                {
+                    if (!merged.TryGetValue(kv.Key, out var listVals)) { listVals = new List<float>(); merged[kv.Key] = listVals; }
+                    listVals.Add(kv.Value.x); listVals.Add(kv.Value.y); listVals.Add(kv.Value.z);
+                }
+            }
+            Vector3 LastOf(List<float> vals)
+            {
+                if (vals == null || vals.Count < 3) return Vector3.zero;
+                int n = vals.Count;
+                return new Vector3(vals[n-3], vals[n-2], vals[n-1]);
+            }
+            if (!hasTL && merged.TryGetValue(planeCornerIdTL, out var tlv)) { planeTLWorld = LastOf(tlv); hasTL = tlv.Count >= 3; }
+            if (!hasTR && merged.TryGetValue(planeCornerIdTR, out var trv)) { planeTRWorld = LastOf(trv); hasTR = trv.Count >= 3; }
+            if (!hasBR && merged.TryGetValue(planeCornerIdBR, out var brv)) { planeBRWorld = LastOf(brv); hasBR = brv.Count >= 3; }
+            if (!hasBL && merged.TryGetValue(planeCornerIdBL, out var blv)) { planeBLWorld = LastOf(blv); hasBL = blv.Count >= 3; }
+        }
+        planeCornersReady = hasTL && hasTR && hasBR && hasBL;
+        if (planeCornersReady) planeCornersFrame = frameCounter;
+    }
+
+    private void ComputeDiagramPlane(out Vector3 ex, out Vector3 ez, out Vector3 originTL, out float widthDiag, out float heightDiag)
+    {
+        // Plane normal from marker plane
+        Vector3 n = Vector3.Normalize(Vector3.Cross(planeTRWorld - planeTLWorld, planeBLWorld - planeTLWorld));
+        // Diagram local axes from tangramDiagramRoot or world axes projected on n
+        Vector3 baseRight = tangramDiagramRoot != null ? tangramDiagramRoot.right : Vector3.right;
+        ex = Vector3.ProjectOnPlane(baseRight, n).normalized;
+        if (ex.sqrMagnitude < 1e-6f) ex = Vector3.right;
+        ez = Vector3.Cross(n, ex).normalized;
+        // Compute diagram bounding box in (ex,ez) coordinates
+        float minX = float.PositiveInfinity, maxX = float.NegativeInfinity;
+        float minZ = float.PositiveInfinity, maxZ = float.NegativeInfinity;
+        Vector3 refPoint = tangramDiagramRoot != null ? tangramDiagramRoot.position : Vector3.zero;
+        foreach (var kv in diagramPiecesByType)
+        {
+            foreach (var p in kv.Value)
+            {
+                Vector3 c = GetPieceCenterWorld(p);
+                Vector3 d = c - refPoint;
+                float sx = Vector3.Dot(d, ex);
+                float sz = Vector3.Dot(d, ez);
+                if (sx < minX) minX = sx;
+                if (sx > maxX) maxX = sx;
+                if (sz < minZ) minZ = sz;
+                if (sz > maxZ) maxZ = sz;
+            }
+        }
+        widthDiag = Mathf.Max(1e-6f, maxX - minX);
+        heightDiag = Mathf.Max(1e-6f, maxZ - minZ);
+        originTL = refPoint + ex * minX + ez * maxZ;
+    }
+
+    private void ApplyMarkerPlaneSimilarityMapping()
+    {
+        // Marker plane basis
+        Vector3 n = Vector3.Normalize(Vector3.Cross(planeTRWorld - planeTLWorld, planeBLWorld - planeTLWorld));
+        Vector3 u = (planeTRWorld - planeTLWorld); float uLen = u.magnitude; u = uLen > 1e-6f ? u / uLen : Vector3.right;
+        Vector3 v = (planeBLWorld - planeTLWorld); float vLen = v.magnitude; v = vLen > 1e-6f ? v / vLen : Vector3.up;
+        Matrix4x4 R = new Matrix4x4();
+        R.SetColumn(0, new Vector4(u.x, u.y, u.z, 0f));
+        R.SetColumn(1, new Vector4(v.x, v.y, v.z, 0f));
+        R.SetColumn(2, new Vector4(n.x, n.y, n.z, 0f));
+        R.SetColumn(3, new Vector4(0f, 0f, 0f, 1f));
+        Matrix4x4 RT = R.transpose;
+
+        // Target diagram basis and bbox
+        ComputeDiagramPlane(out Vector3 ex, out Vector3 ez, out Vector3 originTL, out float widthDiag, out float heightDiag);
+        float markerW = Mathf.Max(1e-6f, (planeTRWorld - planeTLWorld).magnitude);
+        float markerH = Mathf.Max(1e-6f, (planeBLWorld - planeTLWorld).magnitude);
+        float sx = widthDiag / markerW;
+        float sz = heightDiag / markerH;
+        float s = 0.5f * (sx + sz); // uniform scale
+
+        for (int i = 0; i < latestDetections.Count; i++)
+        {
+            var d = latestDetections[i];
+            Vector3 p = d.worldPosition;
+            Vector3 pProj = p - Vector3.Dot(p - planeTLWorld, n) * n;
+            Vector3 local = RT.MultiplyVector(pProj - planeTLWorld);
+            Vector3 mappedWorld = originTL + ex * (local.x * s) + ez * (local.y * s);
+            d.worldPosition = mappedWorld;
+            latestDetections[i] = d;
+        }
+    }
+
+    private void ReportAllDiagramEdgeDiffs(MatchResult res, int limitPerNode)
+    {
+        if (diagramGraph == null || res.matchedPieceTransform == null) return;
+        if (!diagramGraph.indexByTransform.TryGetValue(res.matchedPieceTransform, out int idx)) return;
+        var node = diagramGraph.nodes[idx];
+        int reported = 0;
+        for (int k = 0; k < node.edges.Count; k++)
+        {
+            if (limitPerNode > 0 && reported >= limitPerNode) break;
+            var e = node.edges[k];
+            var neigh = diagramGraph.nodes[e.toIndex].piece;
+            float actualDist = Vector3.Distance(GetPieceCenterWorld(node.piece), GetPieceCenterWorld(neigh));
+            float actualAng = ComputePlanarAngleDeg(GetPieceCenterWorld(node.piece), GetPieceCenterWorld(neigh));
+            float dDiff = Mathf.Abs(actualDist - e.expectedDistanceMeters);
+            float aDiff = Mathf.Abs(NormalizeAngle180(actualAng - e.expectedAngleDeg));
+            Debug.Log($"[TangramMatcher] edge report '{node.piece.name}' -> '{neigh.name}' diff(d)={dDiff:F3}m diff(deg)={aDiff:F1} expected(d)={e.expectedDistanceMeters:F3}m expAng={e.expectedAngleDeg:F1}");
+            if (drawRelationEdgeLines)
+            {
+                Debug.DrawLine(GetPieceCenterWorld(node.piece), GetPieceCenterWorld(neigh), Color.cyan, 0f, false);
+            }
+            reported++;
+        }
+    }
+
+    private void ReportDetectionRelations(MatchResult res, int limitPerNode, bool drawLines)
+    {
+        // Find the detection node corresponding to this match
+        if (latestDetections == null || diagramGraph == null) return;
+        // Locate detection index by arucoId and type
+        int detIndex = -1;
+        for (int i = 0; i < latestDetections.Count; i++)
+        {
+            var d = latestDetections[i];
+            if (d.arucoId == res.arucoId && d.shapeType == res.shapeType)
+            {
+                detIndex = i; break;
+            }
+        }
+        if (detIndex < 0) return;
+        // Build a quick detection graph for neighborhood (already built during matching, but rebuild lightweight here)
+        // We will compute relations to nearest detection neighbors by nominal threshold (exclude corner markers)
+        var centerPos = latestDetections[detIndex].worldPosition;
+        var neighbors = new List<int>();
+        float sizeI = GetNominalSize(latestDetections[detIndex].shapeType);
+        for (int j = 0; j < latestDetections.Count; j++)
+        {
+            if (j == detIndex) continue;
+            if (latestDetections[j].isCorner) continue;
+            float sizeJ = GetNominalSize(latestDetections[j].shapeType);
+            float dist = Vector3.Distance(centerPos, latestDetections[j].worldPosition);
+            float denom = sizeI + sizeJ;
+            float norm = denom > 1e-4f ? dist / denom : float.PositiveInfinity;
+            if (norm <= detectionAdjacencyMaxNormalizedDistance)
+                neighbors.Add(j);
+        }
+        // Optionally limit
+        if (debugDetectionRelationsPerNode > 0 && neighbors.Count > debugDetectionRelationsPerNode)
+        {
+            neighbors.Sort((a, b) => Vector3.Distance(centerPos, latestDetections[a].worldPosition)
+                .CompareTo(Vector3.Distance(centerPos, latestDetections[b].worldPosition)));
+            neighbors.RemoveRange(debugDetectionRelationsPerNode, neighbors.Count - debugDetectionRelationsPerNode);
+        }
+        // Report
+        foreach (int j in neighbors)
+        {
+            var A = latestDetections[detIndex];
+            var B = latestDetections[j];
+            if (A.isCorner || B.isCorner) continue; // safety
+            Vector3 planeN = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
+            Vector3 v = Vector3.ProjectOnPlane(B.worldPosition - A.worldPosition, planeN);
+            float dActual = v.magnitude;
+            // Try expected from matched diagram if both matched (with fallback)
+            float aDeg = ComputePlanarAngleDeg(A.worldPosition, B.worldPosition);
+            Transform pA = FindAssignedPieceFor(A.shapeType, A.arucoId);
+            Transform pB = FindAssignedPieceFor(B.shapeType, B.arucoId);
+            if (pA != null && pB != null)
+            {
+                // Optional: filter to only diagram-graph edges
+                if (restrictRelationsToDiagramEdges && diagramGraph != null)
+                {
+                    if (diagramGraph.indexByTransform.TryGetValue(pA, out int idxA) && diagramGraph.indexByTransform.TryGetValue(pB, out int idxB))
+                    {
+                        if (!IsDiagramEdge(idxA, idxB))
+                        {
+                            // Not an expected relation; skip logging this pair
+                            continue;
+                        }
+                    }
+                }
+                // Special handling: angle-only logging if exactly 2 non-corner detections
+                int nonCornerCount = 0;
+                for (int ii = 0; ii < latestDetections.Count; ii++) if (!latestDetections[ii].isCorner) nonCornerCount++;
+                bool angleOnlyForTwoDetections = (nonCornerCount == 2);
+
+                float dExp = Vector3.Distance(GetPieceCenterWorld(pA), GetPieceCenterWorld(pB));
+                float aExp = ComputePlanarAngleDeg(GetPieceCenterWorld(pA), GetPieceCenterWorld(pB));
+                float aDiff = Mathf.Abs(NormalizeAngle180(aDeg - aExp));
+                if (angleOnlyForTwoDetections)
+                {
+                    bool passAngle = aDiff <= relationMaxAngleDiffDeg;
+                    relLogQueue.Add($"[TangramMatcher] REL det({A.shapeType}:{A.arucoId})->det({B.shapeType}:{B.arucoId}) | (distance ignored: 2-detection) | deg={aDeg:F1} exp={aExp:F1} Δθ={aDiff:F1} (tol {relationMaxAngleDiffDeg:F1}) | {(passAngle ? "PASS" : "FAIL")}");
+                }
+                else
+                {
+                    // Use normalized relation distance reporting when enabled
+                    float dDiff;
+                    if (useNormalizedRelationDistance)
+                    {
+                        float rAct, rExp;
+                        if (useSubsetUnifiedBaseline && cachedBaselineValid)
+                        {
+                            rAct = dActual / Mathf.Max(1e-4f, cachedBaselineDetRef);
+                            rExp = dExp / Mathf.Max(1e-4f, cachedBaselineExpRef);
+                        }
+                        else if (useSubsetUnifiedBaseline)
+                        {
+                            float detRef, expRef;
+                            if (!TryGetReferenceBaselinesFromLastResults(out detRef, out expRef))
+                            {
+                                detRef = Mathf.Max(1e-4f, GetMatchedSubsetMaxDetectionEdgeDistanceThisFrame());
+                                expRef = Mathf.Max(1e-4f, GetMatchedSubsetMaxDiagramDistanceThisFrame());
+                            }
+                            rAct = dActual / Mathf.Max(1e-4f, detRef);
+                            rExp = dExp / Mathf.Max(1e-4f, expRef);
+                        }
+                        else
+                        {
+                            float baseDet = GetDetectionMaxPairDistance();
+                            float baseExp = GetDiagramMaxEdgeLength();
+                            float baseline = Mathf.Max(1e-4f, baseDet, baseExp);
+                            rAct = dActual / baseline;
+                            rExp = dExp / baseline;
+                        }
+                        dDiff = Mathf.Abs(rAct - rExp);
+                        bool pass = dDiff <= relationMaxDistDiff && aDiff <= relationMaxAngleDiffDeg;
+                        relLogQueue.Add($"[TangramMatcher] REL det({A.shapeType}:{A.arucoId})->det({B.shapeType}:{B.arucoId}) | r={rAct:F3} expR={rExp:F3} Δr={dDiff:F3} (tol {relationMaxDistDiff:F3}) | deg={aDeg:F1} exp={aExp:F1} Δθ={aDiff:F1} (tol {relationMaxAngleDiffDeg:F1}) | {(pass ? "PASS" : "FAIL")}");
+                    }
+                    else
+                    {
+                        dDiff = Mathf.Abs(dActual - dExp);
+                bool pass = dDiff <= relationMaxDistDiff && aDiff <= relationMaxAngleDiffDeg;
+                relLogQueue.Add($"[TangramMatcher] REL det({A.shapeType}:{A.arucoId})->det({B.shapeType}:{B.arucoId}) | d={dActual:F3}m exp={dExp:F3}m Δd={dDiff:F3} (tol {relationMaxDistDiff:F3}) | deg={aDeg:F1} exp={aExp:F1} Δθ={aDiff:F1} (tol {relationMaxAngleDiffDeg:F1}) | {(pass ? "PASS" : "FAIL")}");
+                    }
+                }
+            }
+            else
+            {
+                if (!suppressNoExpectedRelationLogs)
+                {
+                    relLogQueue.Add($"[TangramMatcher] REL det({A.shapeType}:{A.arucoId})->det({B.shapeType}:{B.arucoId}) | d={dActual:F3}m | deg={aDeg:F1} | (no expected)");
+                }
+            }
+            if (drawLines)
+            {
+                Debug.DrawLine(A.worldPosition, B.worldPosition, Color.yellow, 0f, false);
+            }
+        }
+    }
+
+    private Transform FindAssignedPieceFor(TangramShapeType type, int arucoId)
+    {
+        // 1) Prefer current-frame match result
+        foreach (var r in lastMatchResults)
+        {
+            if (r.shapeType == type && r.arucoId == arucoId)
+                return r.matchedPieceTransform;
+        }
+        // 2) Optionally fall back to last assignment if recent enough
+        if (!useExpectedFallbackFromLastAssignment) return null;
+        if (lastAssignedPieceByKey.TryGetValue((type, arucoId), out var prev) && prev != null)
+        {
+            // If we track a locked state, ensure it was seen recently to avoid stale expectations
+            if (lockedByPiece.TryGetValue(prev, out var ls))
+            {
+                if (frameCounter - ls.lastSeenFrame <= assignmentCooldownFrames)
+                    return prev;
+                return null;
+            }
+            // If not tracked as locked, still allow as a best-effort fallback
+            return prev;
+        }
+        return null;
+    }
+
+    private float GetDiagramMaxEdgeLength()
+    {
+        if (diagramGraph == null || diagramGraph.nodes == null || diagramGraph.nodes.Count == 0)
+            return 1f;
+        float maxLen = 0.0001f;
+        for (int i = 0; i < diagramGraph.nodes.Count; i++)
+        {
+            var ni = diagramGraph.nodes[i];
+            for (int e = 0; e < ni.edges.Count; e++)
+            {
+                if (ni.edges[e].expectedDistanceMeters > maxLen)
+                    maxLen = ni.edges[e].expectedDistanceMeters;
+            }
+        }
+        return maxLen;
+    }
+
+    private float GetDetectionMaxPairDistance()
+    {
+        if (latestDetections == null || latestDetections.Count == 0) return 1f;
+        Vector3 planeN = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
+        float maxLen = 0.0001f;
+        for (int i = 0; i < latestDetections.Count; i++)
+        {
+            if (latestDetections[i].isCorner) continue;
+            for (int j = i + 1; j < latestDetections.Count; j++)
+            {
+                if (latestDetections[j].isCorner) continue;
+                Vector3 v = Vector3.ProjectOnPlane(latestDetections[j].worldPosition - latestDetections[i].worldPosition, planeN);
+                float d = v.magnitude;
+                if (d > maxLen) maxLen = d;
+            }
+        }
+        return maxLen;
+    }
+
+    private DetectedShape? FindDetection(TangramShapeType type, int arucoId)
+    {
+        for (int i = 0; i < latestDetections.Count; i++)
+        {
+            var d = latestDetections[i];
+            if (d.shapeType == type && d.arucoId == arucoId)
+                return d;
+        }
+        return null;
+    }
+
+    private float GetCurrentMatchedSubsetMaxDiagramEdgeExpected(Dictionary<int, Transform> detToPiece)
+    {
+        if (detToPiece == null || detToPiece.Count < 2) return 1f;
+        var pieces = new List<Transform>(detToPiece.Values);
+        float maxLen = 0.0001f;
+        for (int i = 0; i < pieces.Count; i++)
+        {
+            var pi = pieces[i]; if (pi == null) continue;
+            for (int j = i + 1; j < pieces.Count; j++)
+            {
+                var pj = pieces[j]; if (pj == null) continue;
+                float d = GetDiagramExpectedDistanceBetweenPieces(pi, pj);
+                if (d > maxLen) maxLen = d;
+            }
+        }
+        return maxLen;
+    }
+
+    private float GetCurrentMatchedSubsetMaxDetectionEdgeDistance(DetectionGraph dg, Dictionary<int, Transform> detToPiece)
+    {
+        if (detToPiece == null || detToPiece.Count < 2 || dg == null || dg.nodes == null) return 1f;
+        var keys = new List<int>(detToPiece.Keys);
+        float maxLen = 0.0001f;
+        Vector3 planeN = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
+        for (int i = 0; i < keys.Count; i++)
+        {
+            int ki = keys[i]; if (!detToPiece.TryGetValue(ki, out var pi) || pi == null) continue;
+            for (int j = i + 1; j < keys.Count; j++)
+            {
+                int kj = keys[j]; if (!detToPiece.TryGetValue(kj, out var pj) || pj == null) continue;
+                if (!diagramGraph.indexByTransform.TryGetValue(pi, out int ip)) continue;
+                if (!diagramGraph.indexByTransform.TryGetValue(pj, out int jp)) continue;
+                if (!IsDiagramEdge(ip, jp)) continue;
+                if (ki < 0 || ki >= dg.nodes.Count || kj < 0 || kj >= dg.nodes.Count) continue;
+                Vector3 v = Vector3.ProjectOnPlane(dg.nodes[kj].pos - dg.nodes[ki].pos, planeN);
+                float d = v.magnitude;
+                if (d > maxLen) maxLen = d;
+            }
+        }
+        return maxLen;
+    }
+
+    private float GetMatchedSubsetMaxDetectionEdgeDistanceThisFrame()
+    {
+        if (lastMatchResults == null || lastMatchResults.Count < 2) return 1f;
+        float maxLen = 0.0001f;
+        Vector3 planeN = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
+        for (int i = 0; i < lastMatchResults.Count; i++)
+        {
+            var ai = lastMatchResults[i]; if (ai.matchedPieceTransform == null) continue;
+            for (int j = i + 1; j < lastMatchResults.Count; j++)
+            {
+                var aj = lastMatchResults[j]; if (aj.matchedPieceTransform == null) continue;
+                if (!diagramGraph.indexByTransform.TryGetValue(ai.matchedPieceTransform, out int ip)) continue;
+                if (!diagramGraph.indexByTransform.TryGetValue(aj.matchedPieceTransform, out int jp)) continue;
+                if (!IsDiagramEdge(ip, jp)) continue;
+                Vector3 v = Vector3.ProjectOnPlane(aj.detectionWorldPosition - ai.detectionWorldPosition, planeN);
+                float d = v.magnitude;
+                if (d > maxLen) maxLen = d;
+            }
+        }
+        return maxLen;
+    }
+
+    private float GetDiagramExpectedDistanceBetweenPieces(Transform a, Transform b)
+    {
+        if (diagramGraph == null || a == null || b == null) return Vector3.Distance(GetPieceCenterWorld(a), GetPieceCenterWorld(b));
+        if (!diagramGraph.indexByTransform.TryGetValue(a, out int ia)) return Vector3.Distance(GetPieceCenterWorld(a), GetPieceCenterWorld(b));
+        if (!diagramGraph.indexByTransform.TryGetValue(b, out int ib)) return Vector3.Distance(GetPieceCenterWorld(a), GetPieceCenterWorld(b));
+        // search edges in either direction
+        var na = diagramGraph.nodes[ia];
+        for (int e = 0; e < na.edges.Count; e++) if (na.edges[e].toIndex == ib) return na.edges[e].expectedDistanceMeters;
+        var nb = diagramGraph.nodes[ib];
+        for (int e = 0; e < nb.edges.Count; e++) if (nb.edges[e].toIndex == ia) return nb.edges[e].expectedDistanceMeters;
+        // fallback to actual center distance if not directly connected by an edge
+        return Vector3.Distance(GetPieceCenterWorld(a), GetPieceCenterWorld(b));
+    }
+
+    private bool TryGetSubsetReferenceBaselines(DetectionGraph dg, Dictionary<int, Transform> detToPiece, out float detBaseline, out float expBaseline)
+    {
+        detBaseline = 0f; expBaseline = 0f;
+        if (dg == null || detToPiece == null || detToPiece.Count < 2 || diagramGraph == null)
+            return false;
+        // Invert mapping: piece -> detIndex
+        var pieceToDet = new Dictionary<Transform, int>();
+        foreach (var kv in detToPiece)
+        {
+            if (kv.Value != null && !pieceToDet.ContainsKey(kv.Value)) pieceToDet[kv.Value] = kv.Key;
+        }
+        // Iterate over piece pairs present in mapping; choose the pair with max expected edge distance
+        float bestExp = -1f;
+        Transform bestA = null, bestB = null;
+        var pieces = new List<Transform>(pieceToDet.Keys);
+        for (int i = 0; i < pieces.Count; i++)
+        {
+            var a = pieces[i]; if (a == null) continue;
+            if (!diagramGraph.indexByTransform.TryGetValue(a, out int ia)) continue;
+            for (int j = i + 1; j < pieces.Count; j++)
+            {
+                var b = pieces[j]; if (b == null) continue;
+                if (!diagramGraph.indexByTransform.TryGetValue(b, out int ib)) continue;
+                float exp = -1f;
+                var na = diagramGraph.nodes[ia];
+                for (int e = 0; e < na.edges.Count; e++) if (na.edges[e].toIndex == ib) { exp = na.edges[e].expectedDistanceMeters; break; }
+                if (exp < 0f)
+                {
+                    var nb = diagramGraph.nodes[ib];
+                    for (int e = 0; e < nb.edges.Count; e++) if (nb.edges[e].toIndex == ia) { exp = nb.edges[e].expectedDistanceMeters; break; }
+                }
+                if (exp > bestExp)
+                {
+                    bestExp = exp; bestA = a; bestB = b;
+                }
+            }
+        }
+        if (bestA == null || bestB == null || bestExp <= 0f) return false;
+        expBaseline = bestExp;
+        // Detection baseline: distance between corresponding detection nodes
+        if (!pieceToDet.TryGetValue(bestA, out int da) || !pieceToDet.TryGetValue(bestB, out int db)) return false;
+        if (da < 0 || db < 0 || da >= dg.nodes.Count || db >= dg.nodes.Count) return false;
+        Vector3 planeN = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
+        Vector3 v = Vector3.ProjectOnPlane(dg.nodes[db].pos - dg.nodes[da].pos, planeN);
+        detBaseline = v.magnitude;
+        return detBaseline > 1e-4f && expBaseline > 1e-4f;
+    }
+
+    private bool TryGetReferenceBaselinesFromLastResults(out float detBaseline, out float expBaseline)
+    {
+        detBaseline = 0f; expBaseline = 0f;
+        if (lastMatchResults == null || lastMatchResults.Count < 2 || diagramGraph == null) return false;
+        float bestExp = -1f;
+        MatchResult ra = default, rb = default;
+        for (int i = 0; i < lastMatchResults.Count; i++)
+        {
+            var a = lastMatchResults[i]; if (a.matchedPieceTransform == null) continue;
+            if (!diagramGraph.indexByTransform.TryGetValue(a.matchedPieceTransform, out int ia)) continue;
+            for (int j = i + 1; j < lastMatchResults.Count; j++)
+            {
+                var b = lastMatchResults[j]; if (b.matchedPieceTransform == null) continue;
+                if (!diagramGraph.indexByTransform.TryGetValue(b.matchedPieceTransform, out int ib)) continue;
+                float exp = -1f;
+                var na = diagramGraph.nodes[ia];
+                for (int e = 0; e < na.edges.Count; e++) if (na.edges[e].toIndex == ib) { exp = na.edges[e].expectedDistanceMeters; break; }
+                if (exp < 0f)
+                {
+                    var nb = diagramGraph.nodes[ib];
+                    for (int e = 0; e < nb.edges.Count; e++) if (nb.edges[e].toIndex == ia) { exp = nb.edges[e].expectedDistanceMeters; break; }
+                }
+                if (exp > bestExp)
+                {
+                    bestExp = exp; ra = a; rb = b;
+                }
+            }
+        }
+        if (bestExp <= 0f || ra.matchedPieceTransform == null || rb.matchedPieceTransform == null) return false;
+        expBaseline = bestExp;
+        Vector3 planeN = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
+        Vector3 v = Vector3.ProjectOnPlane(rb.detectionWorldPosition - ra.detectionWorldPosition, planeN);
+        detBaseline = v.magnitude;
+        return detBaseline > 1e-4f && expBaseline > 1e-4f;
+    }
+
+    private float GetMatchedSubsetMaxDiagramDistanceThisFrame()
+    {
+        if (lastMatchResults == null || lastMatchResults.Count < 2 || diagramGraph == null) return 1f;
+        float maxLen = 0.0001f;
+        for (int i = 0; i < lastMatchResults.Count; i++)
+        {
+            var a = lastMatchResults[i]; if (a.matchedPieceTransform == null) continue;
+            if (!diagramGraph.indexByTransform.TryGetValue(a.matchedPieceTransform, out int ia)) continue;
+            for (int j = i + 1; j < lastMatchResults.Count; j++)
+            {
+                var b = lastMatchResults[j]; if (b.matchedPieceTransform == null) continue;
+                if (!diagramGraph.indexByTransform.TryGetValue(b.matchedPieceTransform, out int ib)) continue;
+                // use expected distance if edge exists, else skip (only diagram relations)
+                var na = diagramGraph.nodes[ia];
+                for (int e = 0; e < na.edges.Count; e++)
+                {
+                    if (na.edges[e].toIndex == ib)
+                    {
+                        if (na.edges[e].expectedDistanceMeters > maxLen)
+                            maxLen = na.edges[e].expectedDistanceMeters;
+                        break;
+                    }
+                }
+            }
+        }
+        return maxLen;
+    }
+
+    private void UpdateCachedBaselinesFromLastResults()
+    {
+        if (!useNormalizedRelationDistance || !useSubsetUnifiedBaseline) return;
+        if (cachedBaselineFrame == frameCounter && cachedBaselineValid) return;
+        float detRef, expRef;
+        if (TryGetReferenceBaselinesFromLastResults(out detRef, out expRef))
+        {
+            cachedBaselineDetRef = detRef;
+            cachedBaselineExpRef = expRef;
+            cachedBaselineFrame = frameCounter;
+            cachedBaselineValid = true;
+        }
+        // else: keep previous cached values
     }
 }
 

@@ -10,6 +10,8 @@ using OpenCVForUnity.CoreModule;
 using OpenCVForUnity.ArucoModule;
 using OpenCVForUnity.UnityUtils;
 using OpenCVForUnity.ObjdetectModule;
+using OpenCVForUnity.Calib3dModule;
+using OpenCVForUnity.ImgprocModule;
 
 public class ArUcoMobileTracker : MonoBehaviour
 {
@@ -24,6 +26,13 @@ public class ArUcoMobileTracker : MonoBehaviour
     
     [Header("ArUco Settings")]
     public float markerLength = 0.05f; // 마커 한 변의 실제 길이 (단위: 미터)
+    [Tooltip("Draw an orientation arrow directly onto the camera image for each detected marker (projected +X axis).")]
+    public bool drawMarkerOrientationOnImage = true;
+    [Tooltip("Arrow length as a ratio of markerLength.")]
+    [Range(0.2f, 2.0f)] public float arrowLengthRatio = 0.8f;
+    [Tooltip("Arrow thickness in pixels on the image.")]
+    public int arrowThicknessPx = 2;
+    public Scalar arrowColorBgr = new Scalar(0, 255, 0, 255); // green
     
     [Header("Camera Settings")]
     public bool useFrontCamera = false; // true: 전면 카메라, false: 후면 카메라
@@ -53,7 +62,7 @@ public class ArUcoMobileTracker : MonoBehaviour
 
     // 예시용 기본 카메라 행렬 및 왜곡 계수
     private Mat camMatrix;
-    private Mat distCoeffs;
+    private MatOfDouble distCoeffs;
 
     private bool TryMapArucoIdToShape(int arucoId, out TangramMatcher.TangramShapeType shapeType)
     {
@@ -187,7 +196,7 @@ public class ArUcoMobileTracker : MonoBehaviour
 
         // ArUco 마커 감지
         arucoDetector.detectMarkers(camMat, corners, ids);
-
+            
         if (ids.total() > 0)
         {
             Objdetect.drawDetectedMarkers(camMat, corners, ids);
@@ -224,25 +233,99 @@ public class ArUcoMobileTracker : MonoBehaviour
                     for (int i = 0; i < count; i++)
                     {
                         int arucoId = (int)ids.get(i, 0)[0];
-                        if (!TryMapArucoIdToShape(arucoId, out TangramMatcher.TangramShapeType type))
-                            continue;
+                        bool isCorner = tangramMatcher != null && (
+                            arucoId == tangramMatcher.planeCornerIdTL ||
+                            arucoId == tangramMatcher.planeCornerIdTR ||
+                            arucoId == tangramMatcher.planeCornerIdBR ||
+                            arucoId == tangramMatcher.planeCornerIdBL);
+
+                        bool mapped = TryMapArucoIdToShape(arucoId, out TangramMatcher.TangramShapeType type);
+                        if (!mapped && !isCorner)
+                            continue; // ignore unknown non-corner ids
+                        if (!mapped && isCorner)
+                            type = TangramMatcher.TangramShapeType.Square; // placeholder; not used in matching
 
                         double[] t = tvecs.get(i, 0);
                         Vector3 posCamera = new Vector3((float)t[0], (float)(-t[1]), (float)t[2]);
                         Vector3 worldPos = camTr.TransformPoint(posCamera);
+
+                        // Compute world rotation from rvec for Euler display
+                        Quaternion worldRot = Quaternion.identity;
+                        try
+                        {
+                            if (rvecs != null && rvecs.total() > i)
+                            {
+                                double[] r = rvecs.get(i, 0);
+                                using (Mat rvec = new Mat(3, 1, CvType.CV_64F))
+                                using (Mat rmat = new Mat(3, 3, CvType.CV_64F))
+                                {
+                                    rvec.put(0, 0, r[0]);
+                                    rvec.put(1, 0, r[1]);
+                                    rvec.put(2, 0, r[2]);
+                                    Calib3d.Rodrigues(rvec, rmat);
+                                    Matrix4x4 m = Matrix4x4.identity;
+                                    m.m00 = (float)rmat.get(0, 0)[0]; m.m01 = (float)rmat.get(0, 1)[0]; m.m02 = (float)rmat.get(0, 2)[0];
+                                    m.m10 = (float)rmat.get(1, 0)[0]; m.m11 = (float)rmat.get(1, 1)[0]; m.m12 = (float)rmat.get(1, 2)[0];
+                                    m.m20 = (float)rmat.get(2, 0)[0]; m.m21 = (float)rmat.get(2, 1)[0]; m.m22 = (float)rmat.get(2, 2)[0];
+                                    // Convert OpenCV camera coords (x right, y down, z forward) to Unity world
+                                    Matrix4x4 flipY = Matrix4x4.Scale(new Vector3(1, -1, 1));
+                                    m = flipY * m * flipY;
+                                    worldRot = camTr.rotation * Quaternion.LookRotation(m.GetColumn(2), m.GetColumn(1));
+                                }
+                            }
+                        }
+                        catch (System.Exception)
+                        {
+                            worldRot = Quaternion.identity;
+                        }
 
                         detections.Add(new TangramMatcher.DetectedShape
                         {
                             arucoId = arucoId,
                             shapeType = type,
                             worldPosition = worldPos,
-                            worldRotation = Quaternion.identity,
-                            confidence = 1f
+                            worldRotation = worldRot,
+                            confidence = 1f,
+                            isCorner = isCorner
                         });
+
+                        if (isCorner)
+                        {
+                            tangramMatcher.RegisterCornerObservation(arucoId, worldPos);
+                        }
                     }
 
                     // Pass detections and let the matcher highlight matches
                     tangramMatcher.SetDetections(detections);
+                }
+
+                // Draw orientation arrows onto the camera image (so it appears exactly over the marker)
+                if (drawMarkerOrientationOnImage)
+                {
+                    int count = (int)ids.total();
+                    double arrowLen = Mathf.Max(1e-6f, markerLength * arrowLengthRatio);
+                    for (int i = 0; i < count; i++)
+                    {
+                        // Build object points: origin and +X axis endpoint in marker coordinates
+                        using (MatOfPoint3f objPts = new MatOfPoint3f(
+                            new Point3(0, 0, 0),
+                            new Point3(arrowLen, 0, 0)))
+                        using (Mat rvec = new Mat(3, 1, CvType.CV_64F))
+                        using (Mat tvec = new Mat(3, 1, CvType.CV_64F))
+                        using (MatOfPoint2f imgPts = new MatOfPoint2f())
+                        {
+                            double[] rv = rvecs.get(i, 0);
+                            double[] tv = tvecs.get(i, 0);
+                            rvec.put(0, 0, rv[0]); rvec.put(1, 0, rv[1]); rvec.put(2, 0, rv[2]);
+                            tvec.put(0, 0, tv[0]); tvec.put(1, 0, tv[1]); tvec.put(2, 0, tv[2]);
+                            Calib3d.projectPoints(objPts, rvec, tvec, camMatrix, distCoeffs, imgPts);
+                            Point[] arr = imgPts.toArray();
+                            if (arr != null && arr.Length >= 2)
+                            {
+                                Imgproc.arrowedLine(camMat, arr[0], arr[1], arrowColorBgr, arrowThicknessPx, Imgproc.LINE_AA, 0, 0.2);
+                            }
+                        }
+                    }
                 }
             }
         }
