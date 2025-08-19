@@ -68,11 +68,19 @@ public class ArUcoMobileTracker : MonoBehaviour
     {
         switch (arucoId)
         {
+            // 0, 1: Large Triangle
             case 0: shapeType = TangramMatcher.TangramShapeType.LargeTriangle; return true;
-            case 1: shapeType = TangramMatcher.TangramShapeType.MediumTriangle; return true;
-            case 2: shapeType = TangramMatcher.TangramShapeType.SmallTriangle; return true;
-            case 3: shapeType = TangramMatcher.TangramShapeType.Square; return true;
-            case 4: shapeType = TangramMatcher.TangramShapeType.Parallelogram; return true;
+            case 1: shapeType = TangramMatcher.TangramShapeType.LargeTriangle; return true;
+            // 2: Medium Triangle
+            case 2: shapeType = TangramMatcher.TangramShapeType.MediumTriangle; return true;
+            // 3, 4: Small Triangle
+            case 3: shapeType = TangramMatcher.TangramShapeType.SmallTriangle; return true;
+            case 4: shapeType = TangramMatcher.TangramShapeType.SmallTriangle; return true;
+            // 5: Square
+            case 5: shapeType = TangramMatcher.TangramShapeType.Square; return true;
+            // 6, 7: Parallel (Parallelogram)
+            case 6: shapeType = TangramMatcher.TangramShapeType.Parallelogram; return true;
+            case 7: shapeType = TangramMatcher.TangramShapeType.Parallelogram; return true;
             default:
                 shapeType = default;
                 return false;
@@ -214,6 +222,63 @@ public class ArUcoMobileTracker : MonoBehaviour
                 // Debug output in English for detected ArUco marker position and rotation vector
                 Debug.Log($"[ArUco ID: {id}] Position (meters): X={t[0]:F2}, Y={t[1]:F2}, Z={t[2]:F2}");
                 Debug.Log($"[ArUco ID: {id}] Rotation Vector: X={r[0]:F2}, Y={r[1]:F2}, Z={r[2]:F2}");
+                
+                // Calculate planar coordinates and angle using TangramMatcher coordinate system
+                if (tangramMatcher != null)
+                {
+                    Vector3 posCamera = new Vector3((float)t[0], (float)(-t[1]), (float)t[2]);
+                    Vector3 worldPos = (arUcoCameraTransform != null ? arUcoCameraTransform : Camera.main?.transform)?.TransformPoint(posCamera) ?? Vector3.zero;
+                    
+                    // Compute world rotation from rvec
+                    Quaternion worldRot = Quaternion.identity;
+                    try
+                    {
+                        using (Mat rvec = new Mat(3, 1, CvType.CV_64F))
+                        using (Mat rmat = new Mat(3, 3, CvType.CV_64F))
+                        {
+                            rvec.put(0, 0, r[0]);
+                            rvec.put(1, 0, r[1]);
+                            rvec.put(2, 0, r[2]);
+                            Calib3d.Rodrigues(rvec, rmat);
+                            Matrix4x4 m = Matrix4x4.identity;
+                            m.m00 = (float)rmat.get(0, 0)[0]; m.m01 = (float)rmat.get(0, 1)[0]; m.m02 = (float)rmat.get(0, 2)[0];
+                            m.m10 = (float)rmat.get(1, 0)[0]; m.m11 = (float)rmat.get(1, 1)[0]; m.m12 = (float)rmat.get(1, 2)[0];
+                            m.m20 = (float)rmat.get(2, 0)[0]; m.m21 = (float)rmat.get(2, 1)[0]; m.m22 = (float)rmat.get(2, 2)[0];
+                            Matrix4x4 flipY = Matrix4x4.Scale(new Vector3(1, -1, 1));
+                            m = flipY * m * flipY;
+                            var camTr = arUcoCameraTransform != null ? arUcoCameraTransform : Camera.main?.transform;
+                            if (camTr != null)
+                                worldRot = camTr.rotation * Quaternion.LookRotation(m.GetColumn(2), m.GetColumn(1));
+                        }
+                    }
+                    catch (System.Exception) { }
+                    
+                    // Use TangramMatcher coordinate system for planar projection
+                    Vector3 planeN = tangramMatcher.useXYPlane ? Vector3.forward : (tangramMatcher.tangramDiagramRoot != null ? tangramMatcher.tangramDiagramRoot.up : Vector3.up);
+                    Vector3 planeOrigin = tangramMatcher.tangramDiagramRoot != null ? tangramMatcher.tangramDiagramRoot.position : Vector3.zero;
+                    Vector3 axisU = Vector3.Cross(planeN, Vector3.up);
+                    if (axisU.sqrMagnitude < 1e-6f) axisU = Vector3.Cross(planeN, Vector3.right);
+                    axisU.Normalize();
+                    Vector3 axisV = Vector3.Cross(planeN, axisU).normalized;
+                    
+                    // Project world position onto plane
+                    Vector3 projected = worldPos - Vector3.Dot(worldPos - planeOrigin, planeN) * planeN;
+                    Vector3 rel = projected - planeOrigin;
+                    float projX = Vector3.Dot(rel, axisU);
+                    float projY = Vector3.Dot(rel, axisV);
+                    
+                    // Calculate marker orientation angle on plane
+                    Vector3 markerDir = Vector3.ProjectOnPlane(worldRot * Vector3.right, planeN).normalized;
+                    float planeAngle = 0f;
+                    if (markerDir.sqrMagnitude > 1e-6f)
+                    {
+                        planeAngle = Vector3.SignedAngle(axisU, markerDir, planeN);
+                        while (planeAngle > 180f) planeAngle -= 360f;
+                        while (planeAngle < -180f) planeAngle += 360f;
+                    }
+                    
+                    Debug.Log($"[ArUco ID: {id}] Planar Coord: ({projX:F4}, {projY:F4}) | Plane Angle: {planeAngle:F1}°");
+                }
 
                 // 필요 시, rvec -> 회전 행렬 -> Quaternion 변환 후 Unity 오브젝트에 적용 가능
             }
