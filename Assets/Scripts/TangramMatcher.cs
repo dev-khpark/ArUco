@@ -46,6 +46,19 @@ public class TangramMatcher : MonoBehaviour
     [Tooltip("If true, use a unified baseline within the currently matched subset (max diagram distance among matched pieces) for ratio normalization.")]
     public bool useSubsetUnifiedBaseline = true;
 
+    [Header("First-Pass Relative Scale")]
+    [Tooltip("첫 PASS 관계에서 전역 스케일 s=d_actual/d_expected 를 정하고, 이후 거리는 s에 대한 ±허용비율로 평가합니다.")]
+    public bool useFirstPassRelativeScale = true;
+
+    [Range(0f, 1f)]
+    [Tooltip("상대 허용 비율 (0.25 = ±25%)")]
+    public float firstPassScaleTolerance = 0.25f;
+
+    // Internal state for first-pass relative scale
+    private bool firstPassScaleValid = false;
+    private float firstPassScale = 1f;
+    private int firstPassScaleFrame = -1;
+
     [Header("Diagram Graph Settings")]
     [Tooltip("Adjacency threshold as a ratio of the maximum pairwise center distance among diagram pieces. Create an edge if (centerDist / maxDiagramPairDist) <= this value.")]
     public float diagramAdjacencyMaxNormalizedDistance = 0.8f;
@@ -417,7 +430,7 @@ public class TangramMatcher : MonoBehaviour
     // Queue REL logs and flush at end of frame to avoid (no expected) timing artifacts
     private readonly List<string> relLogQueue = new List<string>();
     
-    // Corner-based projection system
+    // Corner-based projection system with stabilization
     private class CornerPlaneSystem
     {
         public Vector3 origin;           // Origin point of the plane (first corner)
@@ -426,6 +439,8 @@ public class TangramMatcher : MonoBehaviour
         public Vector3 vAxis;           // V axis (up direction) in 2D plane
         public bool isValid;            // Whether the plane system is valid
         public int[] cornerIds;         // Which corner IDs were used (for debugging)
+        public float stability;         // Stability metric (higher = more stable)
+        public int frameCount;          // Number of consecutive frames this plane has been valid
         
         public CornerPlaneSystem()
         {
@@ -435,10 +450,52 @@ public class TangramMatcher : MonoBehaviour
             vAxis = Vector3.forward;
             isValid = false;
             cornerIds = new int[3];
+            stability = 0f;
+            frameCount = 0;
+        }
+        
+        /// <summary>
+        /// Creates a copy of this corner plane system
+        /// </summary>
+        public CornerPlaneSystem Clone()
+        {
+            var copy = new CornerPlaneSystem();
+            copy.origin = this.origin;
+            copy.planeNormal = this.planeNormal;
+            copy.uAxis = this.uAxis;
+            copy.vAxis = this.vAxis;
+            copy.isValid = this.isValid;
+            copy.stability = this.stability;
+            copy.frameCount = this.frameCount;
+            for (int i = 0; i < 3; i++) copy.cornerIds[i] = this.cornerIds[i];
+            return copy;
         }
     }
     
     private CornerPlaneSystem currentCornerPlane = new CornerPlaneSystem();
+    private CornerPlaneSystem previousCornerPlane = new CornerPlaneSystem();
+    
+    // Stabilized corner positions (keyed by ArUco ID)
+    private readonly Dictionary<int, Vector3> stabilizedCornerPositions = new Dictionary<int, Vector3>();
+    private readonly Dictionary<int, Vector3> rawCornerPositions = new Dictionary<int, Vector3>();
+    private readonly Dictionary<int, int> cornerSeenFrames = new Dictionary<int, int>();
+    private int currentFrame = 0;
+    
+    // Corner stabilization settings
+    [Header("Corner Stabilization")]
+    [Tooltip("Enable corner coordinate stabilization to reduce frame-to-frame jitter in plane calculation")]
+    public bool enableCornerStabilization = true;
+    [Tooltip("Smoothing factor for corner positions (0=no smoothing, 1=max smoothing)")]
+    [Range(0f, 0.95f)]
+    public float cornerSmoothingFactor = 0.7f;
+    [Tooltip("Minimum change in corner position (meters) required to trigger plane recalculation")]
+    public float cornerMovementThreshold = 0.01f;
+    [Tooltip("Minimum angle change (degrees) in plane normal required to trigger plane recalculation")]
+    public float planeAngleThreshold = 2.0f;
+    [Tooltip("Minimum number of consecutive frames a plane must be stable before it can be replaced")]
+    public int minStableFrames = 3;
+    [Tooltip("Maximum allowed angular deviation (degrees) from previous plane normal")]
+    public float maxPlaneAngleDeviation = 15.0f;
     
     // Original color cache per renderer/material index
     private class SubMaterialColorInfo
@@ -1874,9 +1931,34 @@ public class TangramMatcher : MonoBehaviour
                                 bool passGating = angleOnlyForTwoDetections ? (a <= graphAngleToleranceDeg) : (d <= graphDistanceToleranceMeters && a <= graphAngleToleranceDeg);
                                 if (passGating)
                                 {
-                                    // Replace distance component with normalized ratio if enabled
+                                    // Replace distance component with selected model
                                     float distanceCost2 = angleOnlyForTwoDetections ? 0f : d;
-                                    if (useNormalizedRelationDistance)
+                                    if (useFirstPassRelativeScale)
+                                    {
+                                        if (!angleOnlyForTwoDetections)
+                                        {
+                                            // Convert to first-pass relative cost using nearest neighbor vectors
+                                            int nearestIdx2 = -1; float nearestDet2 = float.PositiveInfinity; Transform nearestPiece2 = null;
+                                            foreach (int nIdx in dg.nodes[di].neighbors)
+                                            {
+                                                if (!detToPiece.TryGetValue(nIdx, out var np)) continue;
+                                                float dnn = Vector3.Distance(dg.nodes[nIdx].pos, dg.nodes[di].pos);
+                                                if (dnn < nearestDet2) { nearestDet2 = dnn; nearestIdx2 = nIdx; nearestPiece2 = np; }
+                                            }
+                                            if (nearestIdx2 >= 0 && nearestPiece2 != null)
+                                            {
+                                                Vector3 planeN2 = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
+                                                Vector3 vDetP2 = Vector3.ProjectOnPlane(dg.nodes[nearestIdx2].pos - dg.nodes[di].pos, planeN2);
+                                                Vector3 vDiagP2 = Vector3.ProjectOnPlane(GetPieceCenterWorld(nearestPiece2) - GetPieceCenterWorld(p), planeN2);
+                                                float dAct2 = vDetP2.magnitude;
+                                                float dExp2 = vDiagP2.magnitude;
+                                                float relErr2, distCostFP2;
+                                                CheckDistanceWithFirstPassScale(dAct2, dExp2, out relErr2, out distCostFP2);
+                                                distanceCost2 = distCostFP2;
+                                            }
+                                        }
+                                    }
+                                    else if (useNormalizedRelationDistance)
                                     {
                                         if (!angleOnlyForTwoDetections)
                                         {
@@ -1928,9 +2010,12 @@ public class TangramMatcher : MonoBehaviour
                                         float absDistX = vAbs.magnitude;
                                         cost += absoluteDistanceWeightMeters * absDistX;
                                     }
-                                    // Add scale penalty: weighted |scale-1|
-                                    float scalePenalty = Mathf.Abs(usedScale - 1f) * 0.1f; // weight = 0.1 meters per unit scale deviation
-                                    cost += scalePenalty;
+                                    // Add scale penalty only when not using first-pass global scale
+                                    if (!useFirstPassRelativeScale)
+                                    {
+                                        float scalePenalty = Mathf.Abs(usedScale - 1f) * 0.1f; // weight = 0.1 meters per unit scale deviation
+                                        cost += scalePenalty;
+                                    }
 
                                     // Optional absolute orientation gating/cost
                                     if (useAbsoluteOrientation)
@@ -2697,9 +2782,22 @@ AUGMENT:
             if (useScaleNormalization && vDiag.magnitude > 1e-4f)
                 localScale = vDet.magnitude / vDiag.magnitude;
 
-            // Optionally normalize distance by unified baseline
+            // Distance difference per selected model
             float distDiff;
-            if (useNormalizedRelationDistance)
+            if (useFirstPassRelativeScale)
+            {
+                // Use planar magnitudes directly; global first-pass scale handles expected scaling
+                Vector3 vDetP = vDet;
+                Vector3 vDiagP = vDiag;
+                float dAct = vDetP.magnitude;
+                float dExp = vDiagP.magnitude;
+                float relErrFP, distCostFP;
+                CheckDistanceWithFirstPassScale(dAct, dExp, out relErrFP, out distCostFP);
+                distDiff = distCostFP; // cost beyond tolerance only
+                // In this mode, do not penalize pair-local scale deviation separately
+                localScale = 1f;
+            }
+            else if (useNormalizedRelationDistance)
             {
                 float ratioDet, ratioDiag;
                 if (useSubsetUnifiedBaseline)
@@ -2812,6 +2910,34 @@ AUGMENT:
         b.Normalize();
         float ang = Mathf.Abs(Vector3.SignedAngle(a, b, planeNormal));
         return Mathf.Abs(NormalizeAngle180(ang));
+    }
+
+    // First-Pass Relative Scale helpers
+    private void TrySetFirstPassScale(float dActual, float dExpected)
+    {
+        if (!useFirstPassRelativeScale) return;
+        if (firstPassScaleValid) return;
+        if (dExpected <= 1e-4f) return;
+
+        firstPassScale = Mathf.Max(1e-4f, dActual / dExpected);
+        firstPassScaleValid = true;
+        firstPassScaleFrame = frameCounter;
+    }
+
+    private bool CheckDistanceWithFirstPassScale(float dActual, float dExpected, out float relErr, out float distCost)
+    {
+        // If scale is not available yet, temporarily allow distance to pass
+        if (!useFirstPassRelativeScale || !firstPassScaleValid)
+        {
+            relErr = 0f;
+            distCost = 0f;
+            return true;
+        }
+
+        float expected = Mathf.Max(1e-4f, firstPassScale * dExpected);
+        relErr = Mathf.Abs(dActual - expected) / expected;
+        distCost = Mathf.Max(0f, relErr - firstPassScaleTolerance);
+        return relErr <= firstPassScaleTolerance;
     }
 
     // Compute relation angle using cached planar coordinates, rounding to a specified number of decimals before forming the direction.
@@ -3444,39 +3570,168 @@ AUGMENT:
     }
 
     /// <summary>
-    /// Builds a 2D plane coordinate system using 3 corner markers (ArUco IDs 10,11,12,13).
+    /// Stabilizes corner positions using exponential smoothing to reduce jitter
+    /// </summary>
+    private void StabilizeCornerPositions()
+    {
+        currentFrame++;
+        
+        if (!enableCornerStabilization)
+        {
+            // If stabilization is disabled, just copy raw positions
+            stabilizedCornerPositions.Clear();
+            foreach (var det in latestDetections)
+            {
+                if (det.isCorner && det.arucoId >= 10 && det.arucoId <= 13)
+                {
+                    stabilizedCornerPositions[det.arucoId] = det.worldPosition;
+                }
+            }
+            return;
+        }
+        
+        // Update raw corner positions
+        var currentRawPositions = new Dictionary<int, Vector3>();
+        foreach (var det in latestDetections)
+        {
+            if (det.isCorner && det.arucoId >= 10 && det.arucoId <= 13)
+            {
+                currentRawPositions[det.arucoId] = det.worldPosition;
+                rawCornerPositions[det.arucoId] = det.worldPosition;
+                cornerSeenFrames[det.arucoId] = currentFrame;
+            }
+        }
+        
+        // Apply exponential smoothing to corner positions
+        foreach (var kv in currentRawPositions)
+        {
+            int cornerId = kv.Key;
+            Vector3 rawPos = kv.Value;
+            
+            if (stabilizedCornerPositions.ContainsKey(cornerId))
+            {
+                // Smooth with previous stabilized position
+                Vector3 prevStabilized = stabilizedCornerPositions[cornerId];
+                float distance = Vector3.Distance(rawPos, prevStabilized);
+                
+                // Use stronger smoothing for small movements, less for large movements
+                float adaptiveSmoothingFactor = cornerSmoothingFactor;
+                if (distance > cornerMovementThreshold * 2f)
+                {
+                    // Reduce smoothing for larger movements to maintain responsiveness
+                    adaptiveSmoothingFactor *= 0.5f;
+                }
+                
+                stabilizedCornerPositions[cornerId] = Vector3.Lerp(rawPos, prevStabilized, adaptiveSmoothingFactor);
+            }
+            else
+            {
+                // First time seeing this corner, no smoothing
+                stabilizedCornerPositions[cornerId] = rawPos;
+            }
+        }
+        
+        // Remove corners that haven't been seen recently
+        var toRemove = new List<int>();
+        foreach (var kv in cornerSeenFrames)
+        {
+            if (currentFrame - kv.Value > 10) // Remove after 10 frames of absence
+            {
+                toRemove.Add(kv.Key);
+            }
+        }
+        foreach (int cornerId in toRemove)
+        {
+            stabilizedCornerPositions.Remove(cornerId);
+            rawCornerPositions.Remove(cornerId);
+            cornerSeenFrames.Remove(cornerId);
+        }
+    }
+    
+    /// <summary>
+    /// Checks if a new plane configuration is significantly different from the current one
+    /// </summary>
+    private bool IsPlaneConfigurationStable(CornerPlaneSystem newPlane)
+    {
+        if (!currentCornerPlane.isValid || !newPlane.isValid)
+            return false;
+        
+        // Check if corner IDs are the same
+        bool sameCorners = true;
+        for (int i = 0; i < 3; i++)
+        {
+            bool foundMatch = false;
+            for (int j = 0; j < 3; j++)
+            {
+                if (currentCornerPlane.cornerIds[i] == newPlane.cornerIds[j])
+                {
+                    foundMatch = true;
+                    break;
+                }
+            }
+            if (!foundMatch)
+            {
+                sameCorners = false;
+                break;
+            }
+        }
+        
+        if (!sameCorners)
+            return false; // Different corner combination
+        
+        // Check angular deviation
+        float angleDiff = Vector3.Angle(currentCornerPlane.planeNormal, newPlane.planeNormal);
+        if (angleDiff > maxPlaneAngleDeviation)
+            return false; // Too much angular change
+        
+        // Check position stability
+        float originDist = Vector3.Distance(currentCornerPlane.origin, newPlane.origin);
+        if (originDist > cornerMovementThreshold * 3f)
+            return false; // Origin moved too much
+        
+        return true;
+    }
+    
+    /// <summary>
+    /// Builds a 2D plane coordinate system using 3 corner markers (ArUco IDs 10,11,12,13) with stabilization.
     /// Creates a stable reference frame for consistent 2D projection of all 3D points.
     /// </summary>
     private bool BuildCornerPlaneSystem()
     {
-        currentCornerPlane.isValid = false;
+        // First, stabilize corner positions
+        StabilizeCornerPositions();
         
-        // Find available corner markers (IDs 10, 11, 12, 13)
-        List<DetectedShape> availableCorners = new List<DetectedShape>();
-        foreach (var detection in latestDetections)
+        // Find corner markers with IDs 10, 11, 12, 13 using stabilized positions
+        var availableCorners = new List<(int id, Vector3 pos)>();
+        foreach (var kv in stabilizedCornerPositions)
         {
-            if (detection.isCorner && (detection.arucoId >= 10 && detection.arucoId <= 13))
-            {
-                availableCorners.Add(detection);
-            }
+            availableCorners.Add((kv.Key, kv.Value));
         }
         
         if (availableCorners.Count < 3)
         {
             if (debugDetectionRelations)
             {
-                string cornerIds = "";
-                for (int idx = 0; idx < availableCorners.Count; idx++)
+                string cornerIdStr = "";
+                for (int c = 0; c < availableCorners.Count; c++)
                 {
-                    if (idx > 0) cornerIds += ",";
-                    cornerIds += availableCorners[idx].arucoId.ToString();
+                    if (c > 0) cornerIdStr += ",";
+                    cornerIdStr += availableCorners[c].id.ToString();
                 }
-                Debug.Log($"[TangramMatcher] CORNER_PLANE insufficient corners: found {availableCorners.Count}, need 3+ (IDs: {cornerIds})");
+                Debug.Log($"[TangramMatcher] CORNER_PLANE insufficient corners: found {availableCorners.Count} [{cornerIdStr}], need at least 3");
             }
+            
+            // Keep using previous plane if available
+            if (currentCornerPlane.isValid)
+            {
+                currentCornerPlane.frameCount = 0; // Reset frame count due to insufficient corners
+                return true;
+            }
+            currentCornerPlane.isValid = false;
             return false;
         }
         
-        // Try different combinations of 3 corners to find best plane
+        // Find the combination of 3 corners that forms the largest triangle (most stable)
         float bestArea = 0f;
         Vector3 bestP1 = Vector3.zero, bestP2 = Vector3.zero, bestP3 = Vector3.zero;
         int[] bestIds = new int[3];
@@ -3487,9 +3742,9 @@ AUGMENT:
             {
                 for (int k = j + 1; k < availableCorners.Count; k++)
                 {
-                    Vector3 p1 = availableCorners[i].worldPosition;
-                    Vector3 p2 = availableCorners[j].worldPosition;
-                    Vector3 p3 = availableCorners[k].worldPosition;
+                    Vector3 p1 = availableCorners[i].pos;
+                    Vector3 p2 = availableCorners[j].pos;
+                    Vector3 p3 = availableCorners[k].pos;
                     
                     // Calculate triangle area to find the largest triangle (most stable plane)
                     Vector3 v1 = p2 - p1;
@@ -3502,9 +3757,9 @@ AUGMENT:
                         bestP1 = p1;
                         bestP2 = p2;
                         bestP3 = p3;
-                        bestIds[0] = availableCorners[i].arucoId;
-                        bestIds[1] = availableCorners[j].arucoId;
-                        bestIds[2] = availableCorners[k].arucoId;
+                        bestIds[0] = availableCorners[i].id;
+                        bestIds[1] = availableCorners[j].id;
+                        bestIds[2] = availableCorners[k].id;
                     }
                 }
             }
@@ -3517,35 +3772,89 @@ AUGMENT:
             {
                 Debug.Log("[TangramMatcher] CORNER_PLANE degenerate triangle: corners are collinear");
             }
+            
+            // Keep using previous plane if available
+            if (currentCornerPlane.isValid)
+            {
+                currentCornerPlane.frameCount = 0; // Reset frame count due to degenerate triangle
+                return true;
+            }
+            currentCornerPlane.isValid = false;
             return false;
         }
         
-        // Build coordinate system from the best triangle
-        currentCornerPlane.origin = bestP1;
-        currentCornerPlane.cornerIds[0] = bestIds[0];
-        currentCornerPlane.cornerIds[1] = bestIds[1];
-        currentCornerPlane.cornerIds[2] = bestIds[2];
+        // Create candidate new plane
+        var candidatePlane = new CornerPlaneSystem();
+        candidatePlane.origin = bestP1;
+        candidatePlane.cornerIds[0] = bestIds[0];
+        candidatePlane.cornerIds[1] = bestIds[1];
+        candidatePlane.cornerIds[2] = bestIds[2];
         
         // Calculate plane normal
         Vector3 edge1 = bestP2 - bestP1;
         Vector3 edge2 = bestP3 - bestP1;
-        currentCornerPlane.planeNormal = Vector3.Cross(edge1, edge2).normalized;
+        candidatePlane.planeNormal = Vector3.Cross(edge1, edge2).normalized;
         
         // Create orthonormal coordinate system
-        currentCornerPlane.uAxis = edge1.normalized;  // U axis along first edge
-        currentCornerPlane.vAxis = Vector3.Cross(currentCornerPlane.planeNormal, currentCornerPlane.uAxis).normalized;
+        candidatePlane.uAxis = edge1.normalized;  // U axis along first edge
+        candidatePlane.vAxis = Vector3.Cross(candidatePlane.planeNormal, candidatePlane.uAxis).normalized;
+        candidatePlane.isValid = true;
+        candidatePlane.stability = bestArea; // Use area as stability metric
         
-        currentCornerPlane.isValid = true;
+        // Check if we should update the current plane
+        bool shouldUpdate = false;
         
-        if (debugDetectionRelations)
+        if (!currentCornerPlane.isValid)
         {
-            Debug.Log($"[TangramMatcher] CORNER_PLANE constructed using corners [{bestIds[0]},{bestIds[1]},{bestIds[2]}] | " +
-                $"origin=({currentCornerPlane.origin.x:F4},{currentCornerPlane.origin.y:F4},{currentCornerPlane.origin.z:F4}) | " +
-                $"normal=({currentCornerPlane.planeNormal.x:F4},{currentCornerPlane.planeNormal.y:F4},{currentCornerPlane.planeNormal.z:F4}) | " +
-                $"area={bestArea:F4}");
+            // No current plane, use the new one
+            shouldUpdate = true;
+        }
+        else if (IsPlaneConfigurationStable(candidatePlane))
+        {
+            // Configuration is stable, increment frame count and update gradually
+            currentCornerPlane.frameCount++;
+            if (currentCornerPlane.frameCount >= minStableFrames)
+            {
+                // Smoothly update current plane towards candidate
+                float updateRate = 0.3f; // Gentle update rate
+                currentCornerPlane.origin = Vector3.Lerp(currentCornerPlane.origin, candidatePlane.origin, updateRate);
+                currentCornerPlane.planeNormal = Vector3.Slerp(currentCornerPlane.planeNormal, candidatePlane.planeNormal, updateRate);
+                currentCornerPlane.uAxis = Vector3.Slerp(currentCornerPlane.uAxis, candidatePlane.uAxis, updateRate);
+                currentCornerPlane.vAxis = Vector3.Slerp(currentCornerPlane.vAxis, candidatePlane.vAxis, updateRate);
+                currentCornerPlane.stability = Mathf.Lerp(currentCornerPlane.stability, candidatePlane.stability, updateRate);
+            }
+        }
+        else
+        {
+            // Configuration changed significantly
+            if (candidatePlane.stability > currentCornerPlane.stability * 1.2f)
+            {
+                // New configuration is much more stable, switch to it
+                shouldUpdate = true;
+            }
+            else
+            {
+                // Reset frame count but keep current plane
+                currentCornerPlane.frameCount = 0;
+            }
         }
         
-        return true;
+        if (shouldUpdate)
+        {
+            previousCornerPlane = currentCornerPlane.Clone();
+            currentCornerPlane = candidatePlane;
+            currentCornerPlane.frameCount = 1;
+            
+            if (debugDetectionRelations)
+            {
+                Debug.Log($"[TangramMatcher] CORNER_PLANE updated using corners [{bestIds[0]},{bestIds[1]},{bestIds[2]}] | " +
+                    $"origin=({currentCornerPlane.origin.x:F4},{currentCornerPlane.origin.y:F4},{currentCornerPlane.origin.z:F4}) | " +
+                    $"normal=({currentCornerPlane.planeNormal.x:F4},{currentCornerPlane.planeNormal.y:F4},{currentCornerPlane.planeNormal.z:F4}) | " +
+                    $"area={bestArea:F4} | stability={currentCornerPlane.stability:F4}");
+            }
+        }
+        
+        return currentCornerPlane.isValid;
     }
 
     /// <summary>
@@ -3944,14 +4253,23 @@ AUGMENT:
                 {
                     bool passConnectionAngle = connectionAngleDiff <= relationMaxAngleDiffDeg;
                     bool passOri = !useAbsoluteOrientation || (oriA <= absoluteOrientationToleranceDeg && oriB <= absoluteOrientationToleranceDeg);
-                    bool pass = passConnectionAngle && passOri;
+                    // Distance is always true, pass if either connection angle OR orientation passes
+                    bool pass = passConnectionAngle || passOri;
+                    if (useFirstPassRelativeScale && pass && !firstPassScaleValid)
+                    {
+                        TrySetFirstPassScale(dActual, dExp);
+                    }
                     relLogQueue.Add($"[TangramMatcher] REL det({A.shapeType}:{A.arucoId})->det({B.shapeType}:{B.arucoId}) | diag({diagAName})->diag({diagBName}) | (distance ignored: 2-detection) | connectionAngle={actualConnectionAngle:F1}° exp={expectedConnectionAngle:F1}° Δangle={connectionAngleDiff:F1}° (tol {relationMaxAngleDiffDeg:F1}) | ORI_A={oriA:F1}° ORI_B={oriB:F1}° (tol {absoluteOrientationToleranceDeg:F1}) | A2D=({A.planeCoord.x:F2},{A.planeCoord.y:F2}) B2D=({B.planeCoord.x:F2},{B.planeCoord.y:F2}) | {(pass ? "PASS" : "FAIL")}");
                 }
                 else
                 {
-                    // Use normalized relation distance reporting when enabled
-                    float dDiff;
-                    if (useNormalizedRelationDistance)
+                    float relErr = 0f, distCost = 0f;
+                    bool passDist;
+                    if (useFirstPassRelativeScale)
+                    {
+                        passDist = CheckDistanceWithFirstPassScale(dActual, dExp, out relErr, out distCost);
+                    }
+                    else if (useNormalizedRelationDistance)
                     {
                         float rAct, rExp;
                         if (useSubsetUnifiedBaseline && cachedBaselineValid)
@@ -3961,7 +4279,6 @@ AUGMENT:
                         }
                         else if (useSubsetUnifiedBaseline)
                         {
-                            // Improvement B for REL logs: when cache is invalid, avoid subset-derived refs; use global maxima baseline
                             float baseDet = GetDetectionMaxPairDistance();
                             float baseExp = GetDiagramMaxEdgeLength();
                             float baseline = Mathf.Max(1e-4f, baseDet, baseExp);
@@ -3976,20 +4293,40 @@ AUGMENT:
                             rAct = dActual / baseline;
                             rExp = dExp / baseline;
                         }
-                        dDiff = Mathf.Abs(rAct - rExp);
-                        bool passDist = dDiff <= relationMaxDistDiff;
-                        bool passConnectionAngle = connectionAngleDiff <= relationMaxAngleDiffDeg;
-                        bool passOri = !useAbsoluteOrientation || (oriA <= absoluteOrientationToleranceDeg && oriB <= absoluteOrientationToleranceDeg);
-                        bool pass = passDist && passConnectionAngle && passOri;
+                        float dDiff = Mathf.Abs(rAct - rExp);
+                        passDist = dDiff <= relationMaxDistDiff;
+                    }
+                    else
+                    {
+                        float dDiff = Mathf.Abs(dActual - dExp);
+                        passDist = dDiff <= relationMaxDistDiff;
+                    }
+
+                    bool passConnectionAngle = connectionAngleDiff <= relationMaxAngleDiffDeg;
+                    bool passOri = !useAbsoluteOrientation || (oriA <= absoluteOrientationToleranceDeg && oriB <= absoluteOrientationToleranceDeg);
+                    bool pass = passDist && (passConnectionAngle || passOri);
+
+                    if (useFirstPassRelativeScale)
+                    {
+                        if (pass && !firstPassScaleValid)
+                        {
+                            TrySetFirstPassScale(dActual, dExp);
+                        }
+                        relLogQueue.Add($"[TangramMatcher] REL det({A.shapeType}:{A.arucoId})->det({B.shapeType}:{B.arucoId}) | diag({diagAName})->diag({diagBName}) | relErr={(firstPassScaleValid ? relErr : float.NaN):F3} tol±{(firstPassScaleTolerance * 100f):F0}% s={(firstPassScaleValid ? firstPassScale : float.NaN):F3} | connectionAngle={actualConnectionAngle:F1}° (tol {relationMaxAngleDiffDeg:F1}) | ORI_A={oriA:F1}° ORI_B={oriB:F1}° (tol {absoluteOrientationToleranceDeg:F1}) | A2D=({A.planeCoord.x:F2},{A.planeCoord.y:F2}) B2D=({B.planeCoord.x:F2},{B.planeCoord.y:F2}) | {(pass ? "PASS" : "FAIL")}");
+                    }
+                    else if (useNormalizedRelationDistance)
+                    {
+                        float baseDet = GetDetectionMaxPairDistance();
+                        float baseExp = GetDiagramMaxEdgeLength();
+                        float baseline = Mathf.Max(1e-4f, baseDet, baseExp);
+                        float rAct = dActual / baseline;
+                        float rExp = dExp / baseline;
+                        float dDiff = Mathf.Abs(rAct - rExp);
                         relLogQueue.Add($"[TangramMatcher] REL det({A.shapeType}:{A.arucoId})->det({B.shapeType}:{B.arucoId}) | diag({diagAName})->diag({diagBName}) | r={rAct:F3} expR={rExp:F3} Δr={dDiff:F3} (tol {relationMaxDistDiff:F3}) | connectionAngle={actualConnectionAngle:F1}° exp={expectedConnectionAngle:F1}° Δangle={connectionAngleDiff:F1}° (tol {relationMaxAngleDiffDeg:F1}) | ORI_A={oriA:F1}° ORI_B={oriB:F1}° (tol {absoluteOrientationToleranceDeg:F1}) | A2D=({A.planeCoord.x:F2},{A.planeCoord.y:F2}) B2D=({B.planeCoord.x:F2},{B.planeCoord.y:F2}) | {(pass ? "PASS" : "FAIL")}");
                     }
                     else
                     {
-                        dDiff = Mathf.Abs(dActual - dExp);
-                        bool passDist = dDiff <= relationMaxDistDiff;
-                        bool passConnectionAngle = connectionAngleDiff <= relationMaxAngleDiffDeg;
-                        bool passOri = !useAbsoluteOrientation || (oriA <= absoluteOrientationToleranceDeg && oriB <= absoluteOrientationToleranceDeg);
-                        bool pass = passDist && passConnectionAngle && passOri;
+                        float dDiff = Mathf.Abs(dActual - dExp);
                         relLogQueue.Add($"[TangramMatcher] REL det({A.shapeType}:{A.arucoId})->det({B.shapeType}:{B.arucoId}) | diag({diagAName})->diag({diagBName}) | d={dActual:F3}m exp={dExp:F3}m Δd={dDiff:F3} (tol {relationMaxDistDiff:F3}) | connectionAngle={actualConnectionAngle:F1}° exp={expectedConnectionAngle:F1}° Δangle={connectionAngleDiff:F1}° (tol {relationMaxAngleDiffDeg:F1}) | ORI_A={oriA:F1}° ORI_B={oriB:F1}° (tol {absoluteOrientationToleranceDeg:F1}) | A2D=({A.planeCoord.x:F2},{A.planeCoord.y:F2}) B2D=({B.planeCoord.x:F2},{B.planeCoord.y:F2}) | {(pass ? "PASS" : "FAIL")}");
                     }
                 }
@@ -4070,7 +4407,13 @@ AUGMENT:
                             float dDiff = 0f;
                             if (!angleOnlyForTwoDetections)
                             {
-                                if (useNormalizedRelationDistance)
+                                if (useFirstPassRelativeScale)
+                                {
+                                    float relErrP, distCostP;
+                                    CheckDistanceWithFirstPassScale(dAct, dExpEdge, out relErrP, out distCostP);
+                                    dDiff = distCostP;
+                                }
+                                else if (useNormalizedRelationDistance)
                                 {
                                     float rAct = dAct / baseline;
                                     float rExp = dExpEdge / baseline;
@@ -4118,7 +4461,13 @@ AUGMENT:
                                 aAct = ComputeConnectionLineAngle(anchorDetPos, mr.detectionWorldPosition);
                             float dDiff; float rAct=0f, rExp=0f;
                             bool angleOnly = (nonCornerCount == 2);
-                            if (useNormalizedRelationDistance)
+                            if (useFirstPassRelativeScale)
+                            {
+                                float relErrPx, distCostPx;
+                                CheckDistanceWithFirstPassScale(dAct, dExpEdge, out relErrPx, out distCostPx);
+                                dDiff = distCostPx;
+                            }
+                            else if (useNormalizedRelationDistance)
                             {
                                 rAct = dAct / baseline;
                                 rExp = dExpEdge / baseline;
@@ -4129,7 +4478,7 @@ AUGMENT:
                                 dDiff = Mathf.Abs(dAct - dExpEdge);
                             }
                             float aDiff = Mathf.Abs(NormalizeAngle180(aAct - aExpEdge));
-                            bool passDist = angleOnly ? true : (dDiff <= relationMaxDistDiff);
+                            bool passDist = angleOnly ? true : (dDiff <= relationMaxDistDiff); // Distance must pass first (except angle-only mode)
                             bool passAng = aDiff <= relationMaxAngleDiffDeg;
                             bool passOri = true;
                             if (useAbsoluteOrientation)
@@ -4174,13 +4523,25 @@ AUGMENT:
                                     Vector3 rel = proj - po; b2dx = Vector3.Dot(rel, u); b2dy = Vector3.Dot(rel, vaxis);
                                 }
                             }
-                            if (useNormalizedRelationDistance)
+                            // Pass if distance passes AND either connection angle OR orientation passes
+                            bool proxyPass = passDist && (passAng || passOri);
+                            if (useFirstPassRelativeScale)
                             {
-                                relLogQueue.Add($"[TangramMatcher] REL det({res.shapeType}:{res.arucoId})->det({mr.shapeType}:{mr.arucoId}) | diag({diagAName})->diag({diagBName}) (proxy) | r={rAct:F3} expR={rExp:F3} Δr={(Mathf.Abs(rAct-rExp)):F3} (tol {relationMaxDistDiff:F3}) | connectionAngle={aAct:F1}° exp={aExpEdge:F1}° Δangle={aDiff:F1}° (tol {relationMaxAngleDiffDeg:F1}) | A2D=({a2dx:F2},{a2dy:F2}) B2D=({b2dx:F2},{b2dy:F2}) | {(passDist && passAng && passOri ? "PASS" : "FAIL")}");
+                                // Compute ORI for logging regardless of gating flag
+                                float logOriA = 0f, logOriB = 0f;
+                                var detAL = FindDetection(res.shapeType, res.arucoId);
+                                var detBL = FindDetection(mr.shapeType, mr.arucoId);
+                                if (detAL.HasValue) logOriA = ComputeAngleError(res.shapeType, detAL.Value.worldRotation, centerPiece);
+                                if (detBL.HasValue) logOriB = ComputeAngleError(mr.shapeType, detBL.Value.worldRotation, mr.matchedPieceTransform);
+                                relLogQueue.Add($"[TangramMatcher] REL det({res.shapeType}:{res.arucoId})->det({mr.shapeType}:{mr.arucoId}) | diag({diagAName})->diag({diagBName}) (proxy) | relErr={(firstPassScaleValid ? (Mathf.Abs(dAct - Mathf.Max(1e-4f, firstPassScale * dExpEdge)) / Mathf.Max(1e-4f, firstPassScale * dExpEdge)) : float.NaN):F3} tol±{firstPassScaleTolerance * 100f:F0}% s={(firstPassScaleValid ? firstPassScale : float.NaN):F3} | connectionAngle={aAct:F1}° exp={aExpEdge:F1}° Δangle={aDiff:F1}° (tol {relationMaxAngleDiffDeg:F1}) | ORI_A={logOriA:F1}° ORI_B={logOriB:F1}° (tol {absoluteOrientationToleranceDeg:F1}) | A2D=({a2dx:F2},{a2dy:F2}) B2D=({b2dx:F2},{b2dy:F2}) | {(proxyPass ? "PASS" : "FAIL")}");
+                            }
+                            else if (useNormalizedRelationDistance)
+                            {
+                                relLogQueue.Add($"[TangramMatcher] REL det({res.shapeType}:{res.arucoId})->det({mr.shapeType}:{mr.arucoId}) | diag({diagAName})->diag({diagBName}) (proxy) | r={rAct:F3} expR={rExp:F3} Δr={(Mathf.Abs(rAct-rExp)):F3} (tol {relationMaxDistDiff:F3}) | connectionAngle={aAct:F1}° exp={aExpEdge:F1}° Δangle={aDiff:F1}° (tol {relationMaxAngleDiffDeg:F1}) | A2D=({a2dx:F2},{a2dy:F2}) B2D=({b2dx:F2},{b2dy:F2}) | {(proxyPass ? "PASS" : "FAIL")}");
                             }
                             else
                             {
-                                relLogQueue.Add($"[TangramMatcher] REL det({res.shapeType}:{res.arucoId})->det({mr.shapeType}:{mr.arucoId}) | diag({diagAName})->diag({diagBName}) (proxy) | d={dAct:F3}m exp={dExpEdge:F3}m Δd={dDiff:F3} (tol {relationMaxDistDiff:F3}) | connectionAngle={aAct:F1}° exp={aExpEdge:F1}° Δangle={aDiff:F1}° (tol {relationMaxAngleDiffDeg:F1}) | A2D=({a2dx:F2},{a2dy:F2}) B2D=({b2dx:F2},{b2dy:F2}) | {(passDist && passAng && passOri ? "PASS" : "FAIL")}");
+                                relLogQueue.Add($"[TangramMatcher] REL det({res.shapeType}:{res.arucoId})->det({mr.shapeType}:{mr.arucoId}) | diag({diagAName})->diag({diagBName}) (proxy) | d={dAct:F3}m exp={dExpEdge:F3}m Δd={dDiff:F3} (tol {relationMaxDistDiff:F3}) | connectionAngle={aAct:F1}° exp={aExpEdge:F1}° Δangle={aDiff:F1}° (tol {relationMaxAngleDiffDeg:F1}) | A2D=({a2dx:F2},{a2dy:F2}) B2D=({b2dx:F2},{b2dy:F2}) | {(proxyPass ? "PASS" : "FAIL")}");
                             }
                             proxied = true;
                         }
@@ -4263,7 +4624,14 @@ AUGMENT:
                             float dDiffP = 0f; bool passDistP = true;
                             if (!angleOnlyForTwoDetections)
                             {
-                                if (useNormalizedRelationDistance)
+                                if (useFirstPassRelativeScale)
+                                {
+                                    float relErrP2, distCostP2;
+                                    CheckDistanceWithFirstPassScale(dActP, dExpP, out relErrP2, out distCostP2);
+                                    dDiffP = distCostP2;
+                                    passDistP = distCostP2 <= 0f;
+                                }
+                                else if (useNormalizedRelationDistance)
                                 {
                                     float baseDet = GetDetectionMaxPairDistance();
                                     float baseExp = GetDiagramMaxEdgeLength();
@@ -4311,7 +4679,13 @@ AUGMENT:
                 bool passDist = true;
                 if (!angleOnlyForTwoDetections)
                 {
-                    if (useNormalizedRelationDistance)
+                    if (useFirstPassRelativeScale)
+                    {
+                        float relErr2, distCost2;
+                        passDist = CheckDistanceWithFirstPassScale(dAct, dExp, out relErr2, out distCost2);
+                        dDiff = distCost2;
+                    }
+                    else if (useNormalizedRelationDistance)
                     {
                         float baseDet = GetDetectionMaxPairDistance();
                         float baseExp = GetDiagramMaxEdgeLength();
@@ -4338,7 +4712,8 @@ AUGMENT:
                     float oriB = detB.HasValue ? ComputeAngleError(nb.Value.shapeType, detB.Value.worldRotation, neighPiece) : 0f;
                     passOri = (oriA <= absoluteOrientationToleranceDeg && oriB <= absoluteOrientationToleranceDeg);
                 }
-                bool pass = (angleOnlyForTwoDetections ? passAng && passOri : passDist && passAng && passOri);
+                // Pass if distance passes AND either connection angle OR orientation passes
+                bool pass = (angleOnlyForTwoDetections ? (passAng || passOri) : (passDist && (passAng || passOri)));
                 anyPass |= pass;
                 allPass &= pass;
             }
@@ -4667,6 +5042,9 @@ AUGMENT:
             {
                 cachedBaselineValid = false;
                 cachedBaselineFrame = -1;
+                // Reset first-pass scale when new detections appear
+                firstPassScaleValid = false;
+                firstPassScaleFrame = -1;
             }
         }
         catch { /* defensive: do nothing on exceptions */ }
