@@ -59,6 +59,15 @@ public class TangramMatcher : MonoBehaviour
     private float firstPassScale = 1f;
     private int firstPassScaleFrame = -1;
 
+    [Header("First-Pass Direction Offset")]
+    [Tooltip("첫 PASS 관계에서 도형 간 연결 각도의 오프셋(사용자 배치 기준)을 고정하고, 이후엔 기대 각도에 이 오프셋을 더해 비교합니다.")]
+    public bool useFirstPassDirectionOffset = true;
+    [Tooltip("연결 각도 오프셋을 캡처하기 전에는 연결 각도를 무시하고 ORI만으로 첫 PASS를 허용합니다.")]
+    public bool ignoreConnectionAngleUntilOffsetLocked = true;
+    private bool firstPassDirOffsetValid = false;
+    private float firstPassDirOffsetDeg = 0f;
+    private int firstPassDirOffsetFrame = -1;
+
     [Header("Diagram Graph Settings")]
     [Tooltip("Adjacency threshold as a ratio of the maximum pairwise center distance among diagram pieces. Create an edge if (centerDist / maxDiagramPairDist) <= this value.")]
     public float diagramAdjacencyMaxNormalizedDistance = 0.8f;
@@ -3957,6 +3966,21 @@ AUGMENT:
     private void UpdatePlaneCornersFromDetections()
     {
         planeCornersReady = false;
+        // Prefer inferring TL/TR/BR/BL from camera coordinates of detected corner markers
+        var cornerDetections = new List<DetectedShape>();
+        foreach (var d in latestDetections)
+        {
+            if (d.isCorner) cornerDetections.Add(d);
+        }
+        if (cornerDetections.Count >= 4)
+        {
+            if (TryInferPlaneCornersFromCamera(cornerDetections, out var TL, out var TR, out var BR, out var BL))
+            {
+                planeTLWorld = TL; planeTRWorld = TR; planeBRWorld = BR; planeBLWorld = BL;
+                planeCornersReady = true; planeCornersFrame = frameCounter; return;
+            }
+        }
+        // Fallback to ID-based mapping when inference is not possible
         bool hasTL = false, hasTR = false, hasBR = false, hasBL = false;
         foreach (var d in latestDetections)
         {
@@ -4020,6 +4044,18 @@ AUGMENT:
     private void UpdatePlaneCornersFromList(List<DetectedShape> list)
     {
         planeCornersReady = false;
+        // Prefer camera-based inference from provided list
+        var cornerDetections = new List<DetectedShape>();
+        foreach (var d in list) if (d.isCorner) cornerDetections.Add(d);
+        if (cornerDetections.Count >= 4)
+        {
+            if (TryInferPlaneCornersFromCamera(cornerDetections, out var TL, out var TR, out var BR, out var BL))
+            {
+                planeTLWorld = TL; planeTRWorld = TR; planeBRWorld = BR; planeBLWorld = BL;
+                planeCornersReady = true; planeCornersFrame = frameCounter; return;
+            }
+        }
+        // Fallback: IDs within the provided list
         bool hasTL = false, hasTR = false, hasBR = false, hasBL = false;
         foreach (var d in list)
         {
@@ -4053,6 +4089,49 @@ AUGMENT:
         }
         planeCornersReady = hasTL && hasTR && hasBR && hasBL;
         if (planeCornersReady) planeCornersFrame = frameCounter;
+    }
+
+    // Infer TL/TR/BR/BL from camera-view coordinates of detected corner markers
+    private bool TryInferPlaneCornersFromCamera(List<DetectedShape> cornerDetections, out Vector3 TL, out Vector3 TR, out Vector3 BR, out Vector3 BL)
+    {
+        TL = TR = BR = BL = Vector3.zero;
+        try
+        {
+            if (cornerDetections == null || cornerDetections.Count < 4) return false;
+            // Build camera-local coordinates
+            Matrix4x4 camInv;
+            if (arUcoCameraTransform != null)
+                camInv = arUcoCameraTransform.worldToLocalMatrix;
+            else
+                camInv = Matrix4x4.identity; // fallback: world space used as camera space
+
+            var pts = new List<(Vector3 world, Vector3 cam)>();
+            for (int i = 0; i < cornerDetections.Count; i++)
+            {
+                var w = cornerDetections[i].worldPosition;
+                var c = camInv.MultiplyPoint3x4(w);
+                pts.Add((w, c));
+            }
+            // Keep four most stable by z-depth (nearest to camera) if more than 4 present
+            if (pts.Count > 4)
+            {
+                pts.Sort((a, b) => a.cam.z.CompareTo(b.cam.z)); // smaller z is closer in camera local
+                pts = pts.GetRange(0, 4);
+            }
+            // Split into left/right by x
+            pts.Sort((a, b) => a.cam.x.CompareTo(b.cam.x));
+            var leftTwo = new List<(Vector3 world, Vector3 cam)> { pts[0], pts[1] };
+            var rightTwo = new List<(Vector3 world, Vector3 cam)> { pts[2], pts[3] };
+            // Within each side, top = max y, bottom = min y
+            leftTwo.Sort((a, b) => b.cam.y.CompareTo(a.cam.y)); // desc by y
+            rightTwo.Sort((a, b) => b.cam.y.CompareTo(a.cam.y));
+            TL = leftTwo[0].world;
+            BL = leftTwo[leftTwo.Count - 1].world;
+            TR = rightTwo[0].world;
+            BR = rightTwo[rightTwo.Count - 1].world;
+            return true;
+        }
+        catch { return false; }
     }
 
     private void ComputeDiagramPlane(out Vector3 ex, out Vector3 ez, out Vector3 originTL, out float widthDiag, out float heightDiag)
@@ -4243,6 +4322,9 @@ AUGMENT:
                 float dExp = Vector2.Distance(pACoord, pBCoord);
                 // Calculate expected connection angle using 2D projected coordinates
                 float expectedConnectionAngle = ComputeConnectionLineAngleFromCoords(pACoord, pBCoord);
+                // Apply first-pass direction offset if available
+                if (useFirstPassDirectionOffset && firstPassDirOffsetValid)
+                    expectedConnectionAngle = NormalizeAngle180(expectedConnectionAngle + firstPassDirOffsetDeg);
                 float connectionAngleDiff = Mathf.Abs(NormalizeAngle180(actualConnectionAngle - expectedConnectionAngle));
                 // Orientation error per-shape (detection vs matched piece)
                 float oriA = (pA != null) ? ComputeAngleError(A.shapeType, A.worldRotation, pA) : 0f;
@@ -4258,6 +4340,13 @@ AUGMENT:
                     if (useFirstPassRelativeScale && pass && !firstPassScaleValid)
                     {
                         TrySetFirstPassScale(dActual, dExp);
+                    }
+                    // Lock first-pass direction offset when requested and not yet set: set offset so expected+offset equals actual
+                    if (useFirstPassDirectionOffset && pass && !firstPassDirOffsetValid)
+                    {
+                        firstPassDirOffsetDeg = NormalizeAngle180(actualConnectionAngle - ComputeConnectionLineAngleFromCoords(pACoord, pBCoord));
+                        firstPassDirOffsetValid = true;
+                        firstPassDirOffsetFrame = frameCounter;
                     }
                     relLogQueue.Add($"[TangramMatcher] REL det({A.shapeType}:{A.arucoId})->det({B.shapeType}:{B.arucoId}) | diag({diagAName})->diag({diagBName}) | (distance ignored: 2-detection) | connectionAngle={actualConnectionAngle:F1}° exp={expectedConnectionAngle:F1}° Δangle={connectionAngleDiff:F1}° (tol {relationMaxAngleDiffDeg:F1}) | ORI_A={oriA:F1}° ORI_B={oriB:F1}° (tol {absoluteOrientationToleranceDeg:F1}) | A2D=({A.planeCoord.x:F2},{A.planeCoord.y:F2}) B2D=({B.planeCoord.x:F2},{B.planeCoord.y:F2}) | {(pass ? "PASS" : "FAIL")}");
                 }
@@ -4302,8 +4391,11 @@ AUGMENT:
                         passDist = dDiff <= relationMaxDistDiff;
                     }
 
-                    bool passConnectionAngle = connectionAngleDiff <= relationMaxAngleDiffDeg;
+                    bool passConnectionAngle = (ignoreConnectionAngleUntilOffsetLocked && useFirstPassDirectionOffset && !firstPassDirOffsetValid)
+                        ? true
+                        : (connectionAngleDiff <= relationMaxAngleDiffDeg);
                     bool passOri = !useAbsoluteOrientation || (oriA <= absoluteOrientationToleranceDeg && oriB <= absoluteOrientationToleranceDeg);
+                    // First relation: require ORI only until offset is locked; then use (Angle OR ORI)
                     bool pass = passDist && (passConnectionAngle || passOri);
 
                     if (useFirstPassRelativeScale)
@@ -4312,7 +4404,14 @@ AUGMENT:
                         {
                             TrySetFirstPassScale(dActual, dExp);
                         }
-                        relLogQueue.Add($"[TangramMatcher] REL det({A.shapeType}:{A.arucoId})->det({B.shapeType}:{B.arucoId}) | diag({diagAName})->diag({diagBName}) | relErr={(firstPassScaleValid ? relErr : float.NaN):F3} tol±{(firstPassScaleTolerance * 100f):F0}% s={(firstPassScaleValid ? firstPassScale : float.NaN):F3} | connectionAngle={actualConnectionAngle:F1}° (tol {relationMaxAngleDiffDeg:F1}) | ORI_A={oriA:F1}° ORI_B={oriB:F1}° (tol {absoluteOrientationToleranceDeg:F1}) | A2D=({A.planeCoord.x:F2},{A.planeCoord.y:F2}) B2D=({B.planeCoord.x:F2},{B.planeCoord.y:F2}) | {(pass ? "PASS" : "FAIL")}");
+                        // If angle gating was ignored and overall pass achieved, lock direction offset now
+                        if (useFirstPassDirectionOffset && !firstPassDirOffsetValid && pass)
+                        {
+                            firstPassDirOffsetDeg = NormalizeAngle180(actualConnectionAngle - ComputeConnectionLineAngleFromCoords(pACoord, pBCoord));
+                            firstPassDirOffsetValid = true;
+                            firstPassDirOffsetFrame = frameCounter;
+                        }
+                        relLogQueue.Add($"[TangramMatcher] REL det({A.shapeType}:{A.arucoId})->det({B.shapeType}:{B.arucoId}) | diag({diagAName})->diag({diagBName}) | relErr={(firstPassScaleValid ? relErr : float.NaN):F3} tol±{(firstPassScaleTolerance * 100f):F0}% s={(firstPassScaleValid ? firstPassScale : float.NaN):F3} | Dist={(passDist?"PASS":"FAIL")} Angle={(passConnectionAngle?"PASS":"FAIL")} Ori={(passOri?"PASS":"FAIL")} | connectionAngle={actualConnectionAngle:F1}° (tol {relationMaxAngleDiffDeg:F1}) | ORI_A={oriA:F1}° ORI_B={oriB:F1}° (tol {absoluteOrientationToleranceDeg:F1}) | A2D=({A.planeCoord.x:F2},{A.planeCoord.y:F2}) B2D=({B.planeCoord.x:F2},{B.planeCoord.y:F2}) | {(pass ? "PASS" : "FAIL")}");
                     }
                     else if (useNormalizedRelationDistance)
                     {
@@ -4322,12 +4421,12 @@ AUGMENT:
                         float rAct = dActual / baseline;
                         float rExp = dExp / baseline;
                         float dDiff = Mathf.Abs(rAct - rExp);
-                        relLogQueue.Add($"[TangramMatcher] REL det({A.shapeType}:{A.arucoId})->det({B.shapeType}:{B.arucoId}) | diag({diagAName})->diag({diagBName}) | r={rAct:F3} expR={rExp:F3} Δr={dDiff:F3} (tol {relationMaxDistDiff:F3}) | connectionAngle={actualConnectionAngle:F1}° exp={expectedConnectionAngle:F1}° Δangle={connectionAngleDiff:F1}° (tol {relationMaxAngleDiffDeg:F1}) | ORI_A={oriA:F1}° ORI_B={oriB:F1}° (tol {absoluteOrientationToleranceDeg:F1}) | A2D=({A.planeCoord.x:F2},{A.planeCoord.y:F2}) B2D=({B.planeCoord.x:F2},{B.planeCoord.y:F2}) | {(pass ? "PASS" : "FAIL")}");
+                        relLogQueue.Add($"[TangramMatcher] REL det({A.shapeType}:{A.arucoId})->det({B.shapeType}:{B.arucoId}) | diag({diagAName})->diag({diagBName}) | r={rAct:F3} expR={rExp:F3} Δr={dDiff:F3} (tol {relationMaxDistDiff:F3}) | Dist={(passDist?"PASS":"FAIL")} Angle={(passConnectionAngle?"PASS":"FAIL")} Ori={(passOri?"PASS":"FAIL")} | connectionAngle={actualConnectionAngle:F1}° exp={expectedConnectionAngle:F1}° Δangle={connectionAngleDiff:F1}° (tol {relationMaxAngleDiffDeg:F1}) | ORI_A={oriA:F1}° ORI_B={oriB:F1}° (tol {absoluteOrientationToleranceDeg:F1}) | A2D=({A.planeCoord.x:F2},{A.planeCoord.y:F2}) B2D=({B.planeCoord.x:F2},{B.planeCoord.y:F2}) | {(pass ? "PASS" : "FAIL")}");
                     }
                     else
                     {
                         float dDiff = Mathf.Abs(dActual - dExp);
-                        relLogQueue.Add($"[TangramMatcher] REL det({A.shapeType}:{A.arucoId})->det({B.shapeType}:{B.arucoId}) | diag({diagAName})->diag({diagBName}) | d={dActual:F3}m exp={dExp:F3}m Δd={dDiff:F3} (tol {relationMaxDistDiff:F3}) | connectionAngle={actualConnectionAngle:F1}° exp={expectedConnectionAngle:F1}° Δangle={connectionAngleDiff:F1}° (tol {relationMaxAngleDiffDeg:F1}) | ORI_A={oriA:F1}° ORI_B={oriB:F1}° (tol {absoluteOrientationToleranceDeg:F1}) | A2D=({A.planeCoord.x:F2},{A.planeCoord.y:F2}) B2D=({B.planeCoord.x:F2},{B.planeCoord.y:F2}) | {(pass ? "PASS" : "FAIL")}");
+                        relLogQueue.Add($"[TangramMatcher] REL det({A.shapeType}:{A.arucoId})->det({B.shapeType}:{B.arucoId}) | diag({diagAName})->diag({diagBName}) | d={dActual:F3}m exp={dExp:F3}m Δd={dDiff:F3} (tol {relationMaxDistDiff:F3}) | Dist={(passDist?"PASS":"FAIL")} Angle={(passConnectionAngle?"PASS":"FAIL")} Ori={(passOri?"PASS":"FAIL")} | connectionAngle={actualConnectionAngle:F1}° exp={expectedConnectionAngle:F1}° Δangle={connectionAngleDiff:F1}° (tol {relationMaxAngleDiffDeg:F1}) | ORI_A={oriA:F1}° ORI_B={oriB:F1}° (tol {absoluteOrientationToleranceDeg:F1}) | A2D=({A.planeCoord.x:F2},{A.planeCoord.y:F2}) B2D=({B.planeCoord.x:F2},{B.planeCoord.y:F2}) | {(pass ? "PASS" : "FAIL")}");
                     }
                 }
             }
@@ -4533,15 +4632,15 @@ AUGMENT:
                                 var detBL = FindDetection(mr.shapeType, mr.arucoId);
                                 if (detAL.HasValue) logOriA = ComputeAngleError(res.shapeType, detAL.Value.worldRotation, centerPiece);
                                 if (detBL.HasValue) logOriB = ComputeAngleError(mr.shapeType, detBL.Value.worldRotation, mr.matchedPieceTransform);
-                                relLogQueue.Add($"[TangramMatcher] REL det({res.shapeType}:{res.arucoId})->det({mr.shapeType}:{mr.arucoId}) | diag({diagAName})->diag({diagBName}) (proxy) | relErr={(firstPassScaleValid ? (Mathf.Abs(dAct - Mathf.Max(1e-4f, firstPassScale * dExpEdge)) / Mathf.Max(1e-4f, firstPassScale * dExpEdge)) : float.NaN):F3} tol±{firstPassScaleTolerance * 100f:F0}% s={(firstPassScaleValid ? firstPassScale : float.NaN):F3} | connectionAngle={aAct:F1}° exp={aExpEdge:F1}° Δangle={aDiff:F1}° (tol {relationMaxAngleDiffDeg:F1}) | ORI_A={logOriA:F1}° ORI_B={logOriB:F1}° (tol {absoluteOrientationToleranceDeg:F1}) | A2D=({a2dx:F2},{a2dy:F2}) B2D=({b2dx:F2},{b2dy:F2}) | {(proxyPass ? "PASS" : "FAIL")}");
+                                relLogQueue.Add($"[TangramMatcher] REL det({res.shapeType}:{res.arucoId})->det({mr.shapeType}:{mr.arucoId}) | diag({diagAName})->diag({diagBName}) (proxy) | relErr={(firstPassScaleValid ? (Mathf.Abs(dAct - Mathf.Max(1e-4f, firstPassScale * dExpEdge)) / Mathf.Max(1e-4f, firstPassScale * dExpEdge)) : float.NaN):F3} tol±{firstPassScaleTolerance * 100f:F0}% s={(firstPassScaleValid ? firstPassScale : float.NaN):F3} | Dist={(passDist?"PASS":"FAIL")} Angle={(passAng?"PASS":"FAIL")} Ori={(passOri?"PASS":"FAIL")} | connectionAngle={aAct:F1}° exp={aExpEdge:F1}° Δangle={aDiff:F1}° (tol {relationMaxAngleDiffDeg:F1}) | ORI_A={logOriA:F1}° ORI_B={logOriB:F1}° (tol {absoluteOrientationToleranceDeg:F1}) | A2D=({a2dx:F2},{a2dy:F2}) B2D=({b2dx:F2},{b2dy:F2}) | {(proxyPass ? "PASS" : "FAIL")}");
                             }
                             else if (useNormalizedRelationDistance)
                             {
-                                relLogQueue.Add($"[TangramMatcher] REL det({res.shapeType}:{res.arucoId})->det({mr.shapeType}:{mr.arucoId}) | diag({diagAName})->diag({diagBName}) (proxy) | r={rAct:F3} expR={rExp:F3} Δr={(Mathf.Abs(rAct-rExp)):F3} (tol {relationMaxDistDiff:F3}) | connectionAngle={aAct:F1}° exp={aExpEdge:F1}° Δangle={aDiff:F1}° (tol {relationMaxAngleDiffDeg:F1}) | A2D=({a2dx:F2},{a2dy:F2}) B2D=({b2dx:F2},{b2dy:F2}) | {(proxyPass ? "PASS" : "FAIL")}");
+                                relLogQueue.Add($"[TangramMatcher] REL det({res.shapeType}:{res.arucoId})->det({mr.shapeType}:{mr.arucoId}) | diag({diagAName})->diag({diagBName}) (proxy) | r={rAct:F3} expR={rExp:F3} Δr={(Mathf.Abs(rAct-rExp)):F3} (tol {relationMaxDistDiff:F3}) | Dist={(passDist?"PASS":"FAIL")} Angle={(passAng?"PASS":"FAIL")} Ori={(passOri?"PASS":"FAIL")} | connectionAngle={aAct:F1}° exp={aExpEdge:F1}° Δangle={aDiff:F1}° (tol {relationMaxAngleDiffDeg:F1}) | A2D=({a2dx:F2},{a2dy:F2}) B2D=({b2dx:F2},{b2dy:F2}) | {(proxyPass ? "PASS" : "FAIL")}");
                             }
                             else
                             {
-                                relLogQueue.Add($"[TangramMatcher] REL det({res.shapeType}:{res.arucoId})->det({mr.shapeType}:{mr.arucoId}) | diag({diagAName})->diag({diagBName}) (proxy) | d={dAct:F3}m exp={dExpEdge:F3}m Δd={dDiff:F3} (tol {relationMaxDistDiff:F3}) | connectionAngle={aAct:F1}° exp={aExpEdge:F1}° Δangle={aDiff:F1}° (tol {relationMaxAngleDiffDeg:F1}) | A2D=({a2dx:F2},{a2dy:F2}) B2D=({b2dx:F2},{b2dy:F2}) | {(proxyPass ? "PASS" : "FAIL")}");
+                                relLogQueue.Add($"[TangramMatcher] REL det({res.shapeType}:{res.arucoId})->det({mr.shapeType}:{mr.arucoId}) | diag({diagAName})->diag({diagBName}) (proxy) | d={dAct:F3}m exp={dExpEdge:F3}m Δd={dDiff:F3} (tol {relationMaxDistDiff:F3}) | Dist={(passDist?"PASS":"FAIL")} Angle={(passAng?"PASS":"FAIL")} Ori={(passOri?"PASS":"FAIL")} | connectionAngle={aAct:F1}° exp={aExpEdge:F1}° Δangle={aDiff:F1}° (tol {relationMaxAngleDiffDeg:F1}) | A2D=({a2dx:F2},{a2dy:F2}) B2D=({b2dx:F2},{b2dy:F2}) | {(proxyPass ? "PASS" : "FAIL")}");
                             }
                             proxied = true;
                         }
