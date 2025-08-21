@@ -1475,7 +1475,8 @@ public class TangramMatcher : MonoBehaviour
         {
             foreach (Transform piece in kv.Value)
             {
-                if (matchedPieces.Contains(piece)) continue;
+                bool isMatchedOrLocked = matchedPieces.Contains(piece) || (enableStatefulMatching && lockedByPiece.TryGetValue(piece, out var ls0) && ls0.isLocked);
+                if (isMatchedOrLocked) continue;
                 if (useNeutralColorMode)
                 {
                     SetRendererColor(piece.gameObject, neutralColor);
@@ -1491,8 +1492,10 @@ public class TangramMatcher : MonoBehaviour
         }
 
         // Then, set matched pieces to color (optionally by error magnitude)
+        var colored = new HashSet<Transform>();
         foreach (Transform piece in matchedPieces)
         {
+            colored.Add(piece);
             if (useNeutralColorMode && matchedRestoresOriginalColor)
             {
                 RestoreRendererOriginalColor(piece.gameObject);
@@ -1525,6 +1528,26 @@ public class TangramMatcher : MonoBehaviour
             else
             {
                 SetRendererColor(piece.gameObject, matchedColor);
+            }
+        }
+
+        // Also color locked pieces not already colored this frame
+        if (enableStatefulMatching)
+        {
+            foreach (var kv in lockedByPiece)
+            {
+                var piece = kv.Key;
+                var ls = kv.Value;
+                if (!ls.isLocked) continue;
+                if (colored.Contains(piece)) continue;
+                if (useNeutralColorMode && matchedRestoresOriginalColor)
+                {
+                    RestoreRendererOriginalColor(piece.gameObject);
+                }
+                else
+                {
+                    SetRendererColor(piece.gameObject, matchedColor);
+                }
             }
         }
     }
@@ -2027,6 +2050,7 @@ public class TangramMatcher : MonoBehaviour
                                     }
 
                                     // Optional absolute orientation gating/cost
+                                    bool oriPassLocal = !useAbsoluteOrientation; // if ORI not used, treat as false here; we'll recompute
                                     if (useAbsoluteOrientation)
                                     {
                                         var det = latestDetections[node.detIndex];
@@ -2052,12 +2076,23 @@ public class TangramMatcher : MonoBehaviour
                                                 }
                                                 continue;
                                             }
+                                            oriPassLocal = true;
                                             if (debugLogOrientationDiff)
                                             {
                                                 Debug.Log($"[TangramMatcher] ORI diff det({node.type}:{latestDetections[node.detIndex].arucoId}) -> diag({p.name}) | absOri={absOriDeg:F1}°");
                                             }
                                             cost += absoluteOrientationWeightMetersPerDeg * absOriDeg;
                                         }
+                                    }
+                                    // If relation angle or ORI passes, prefer nearest diagram piece by absolute planar distance
+                                    bool anglePassLocal = (a <= graphAngleToleranceDeg);
+                                    if (anglePassLocal || oriPassLocal)
+                                    {
+                                        var detx2 = latestDetections[node.detIndex];
+                                        Vector3 planeN_abs2 = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
+                                        Vector3 vAbs2 = Vector3.ProjectOnPlane(GetPieceCenterWorld(p) - detx2.worldPosition, planeN_abs2);
+                                        float absDistPref = vAbs2.magnitude;
+                                        cost = absDistPref;
                                     }
                                     if (preferPreviousAssignment)
                                     {

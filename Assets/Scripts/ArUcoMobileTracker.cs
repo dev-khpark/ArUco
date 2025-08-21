@@ -64,6 +64,110 @@ public class ArUcoMobileTracker : MonoBehaviour
     private Mat camMatrix;
     private MatOfDouble distCoeffs;
 
+    // -------- Stability buffer (10-frame time shifting) --------
+    private struct BufferedSample
+    {
+        public int frame;
+        public int arucoId;
+        public TangramMatcher.TangramShapeType shapeType;
+        public Vector3 worldPos;
+        public Quaternion worldRot;
+        public bool isCorner;
+    }
+
+    [Tooltip("Number of frames for stability time-shifting window.")]
+    public int stabilityWindowFrames = 10;
+
+    // Buffer per ArUco ID
+    private readonly Dictionary<int, List<BufferedSample>> bufferById = new Dictionary<int, List<BufferedSample>>();
+
+    private void AddToBuffer(int arucoId, TangramMatcher.TangramShapeType type, Vector3 worldPos, Quaternion worldRot, bool isCorner)
+    {
+        if (!bufferById.TryGetValue(arucoId, out var list))
+        {
+            list = new List<BufferedSample>();
+            bufferById[arucoId] = list;
+        }
+        list.Add(new BufferedSample
+        {
+            frame = Time.frameCount,
+            arucoId = arucoId,
+            shapeType = type,
+            worldPos = worldPos,
+            worldRot = worldRot,
+            isCorner = isCorner
+        });
+        // Prune old frames beyond window
+        int minFrame = Time.frameCount - Mathf.Max(1, stabilityWindowFrames) + 1;
+        int idx = 0;
+        while (idx < list.Count)
+        {
+            if (list[idx].frame >= minFrame) break;
+            idx++;
+        }
+        if (idx > 0) list.RemoveRange(0, idx);
+    }
+
+    private List<TangramMatcher.DetectedShape> BuildStableDetectionsFromBuffer()
+    {
+        var stable = new List<TangramMatcher.DetectedShape>();
+        int minFrame = Time.frameCount - Mathf.Max(1, stabilityWindowFrames) + 1;
+        foreach (var kv in bufferById)
+        {
+            var samples = kv.Value;
+            // Keep only samples within window
+            var window = new List<BufferedSample>();
+            for (int i = 0; i < samples.Count; i++)
+            {
+                if (samples[i].frame >= minFrame) window.Add(samples[i]);
+            }
+            if (window.Count == 0) continue;
+
+            // Compute per-axis medians
+            float Median(List<float> arr)
+            {
+                arr.Sort();
+                int n = arr.Count;
+                if (n == 0) return 0f;
+                if ((n & 1) == 1) return arr[n / 2];
+                return 0.5f * (arr[n / 2 - 1] + arr[n / 2]);
+            }
+
+            var xs = new List<float>(window.Count);
+            var ys = new List<float>(window.Count);
+            var zs = new List<float>(window.Count);
+            for (int i = 0; i < window.Count; i++)
+            {
+                xs.Add(window[i].worldPos.x);
+                ys.Add(window[i].worldPos.y);
+                zs.Add(window[i].worldPos.z);
+            }
+            Vector3 median = new Vector3(Median(xs), Median(ys), Median(zs));
+
+            // Choose medoid (closest to median position)
+            int bestIdx = 0; float bestDist = float.PositiveInfinity;
+            for (int i = 0; i < window.Count; i++)
+            {
+                float d = Vector3.SqrMagnitude(window[i].worldPos - median);
+                if (d < bestDist)
+                {
+                    bestDist = d; bestIdx = i;
+                }
+            }
+            var best = window[bestIdx];
+            stable.Add(new TangramMatcher.DetectedShape
+            {
+                arucoId = best.arucoId,
+                shapeType = best.shapeType,
+                worldPosition = best.worldPos,
+                worldRotation = best.worldRot,
+                confidence = 1f,
+                isCorner = best.isCorner
+            });
+        }
+        return stable;
+    }
+
     private bool TryMapArucoIdToShape(int arucoId, out TangramMatcher.TangramShapeType shapeType)
     {
         switch (arucoId)
@@ -220,8 +324,8 @@ public class ArUcoMobileTracker : MonoBehaviour
                 double[] r = rvecs.get(i, 0); // 회전 벡터
 
                 // Debug output in English for detected ArUco marker position and rotation vector
-                Debug.Log($"[ArUco ID: {id}] Position (meters): X={t[0]:F2}, Y={t[1]:F2}, Z={t[2]:F2}");
-                Debug.Log($"[ArUco ID: {id}] Rotation Vector: X={r[0]:F2}, Y={r[1]:F2}, Z={r[2]:F2}");
+                Debug.Log($"[Frame {Time.frameCount}] [ArUco ID: {id}] Position (meters): X={t[0]:F2}, Y={t[1]:F2}, Z={t[2]:F2}");
+                Debug.Log($"[Frame {Time.frameCount}] [ArUco ID: {id}] Rotation Vector: X={r[0]:F2}, Y={r[1]:F2}, Z={r[2]:F2}");
                 
                 // Calculate planar coordinates and angle using TangramMatcher coordinate system
                 if (tangramMatcher != null)
@@ -277,7 +381,7 @@ public class ArUcoMobileTracker : MonoBehaviour
                         while (planeAngle < -180f) planeAngle += 360f;
                     }
                     
-                    Debug.Log($"[ArUco ID: {id}] Planar Coord: ({projX:F4}, {projY:F4}) | Plane Angle: {planeAngle:F1}°");
+                    Debug.Log($"[Frame {Time.frameCount}] [ArUco ID: {id}] Planar Coord: ({projX:F4}, {projY:F4}) | Plane Angle: {planeAngle:F1}°");
                 }
 
                 // 필요 시, rvec -> 회전 행렬 -> Quaternion 변환 후 Unity 오브젝트에 적용 가능
@@ -344,6 +448,9 @@ public class ArUcoMobileTracker : MonoBehaviour
                             worldRot = Quaternion.identity;
                         }
 
+                        // Push into stability buffer
+                        AddToBuffer(arucoId, type, worldPos, worldRot, isCorner);
+                        // For immediate visualization, still collect raw detections this frame (optional)
                         detections.Add(new TangramMatcher.DetectedShape
                         {
                             arucoId = arucoId,
@@ -360,8 +467,10 @@ public class ArUcoMobileTracker : MonoBehaviour
                         }
                     }
 
-                    // Pass detections and let the matcher highlight matches
-                    tangramMatcher.SetDetections(detections);
+                    // Build stable detections over the last N frames; prefer medoid per ID
+                    var stable = BuildStableDetectionsFromBuffer();
+                    // Use stable detections for matching
+                    tangramMatcher.SetDetections(stable);
                 }
 
                 // Draw orientation arrows onto the camera image (so it appears exactly over the marker)
