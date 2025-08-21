@@ -18,6 +18,16 @@ using OpenCVForUnity.Calib3dModule;
 /// </summary>
 public class TangramMatcher : MonoBehaviour
 {
+    [Header("Angle Offset Settings")]
+    [Tooltip("Global angle offset applied to connection angles and/or orientations (degrees). Default: 180")]
+    [Range(0f, 360f)]
+    public float angleOffset = 180f;
+
+    [Tooltip("Apply angle offset to connection line angles between shapes")]
+    public bool applyOffsetToConnectionAngles = true;
+
+    [Tooltip("Apply angle offset to individual shape orientations")]
+    public bool applyOffsetToOrientations = true;
     [Header("References")]
     [Tooltip("Root Transform that contains the answer pieces as children (triangle_l_1, triangle_l_2, triangle_m, triangle_s_1, triangle_s_2, square, parallel)")]
     public Transform tangramDiagramRoot;
@@ -1448,6 +1458,8 @@ public class TangramMatcher : MonoBehaviour
         // Flush REL logs at end of frame
         if (relLogQueue.Count > 0)
         {
+            // One-line header summarizing current angle offset settings for REL logs
+            Debug.Log($"[TangramMatcher] REL settings | angleOffset={angleOffset:F1}° conn={(applyOffsetToConnectionAngles ? 1 : 0)} ori={(applyOffsetToOrientations ? 1 : 0)}");
             foreach (var line in relLogQueue) Debug.Log(line);
             relLogQueue.Clear();
         }
@@ -2923,7 +2935,11 @@ AUGMENT:
         Vector3 refForward = Vector3.ProjectOnPlane(Vector3.right, planeNormal).normalized;
         if (refForward.sqrMagnitude < 1e-6f) refForward = Vector3.right;
         float ang = Vector3.SignedAngle(refForward, dirProj, planeNormal);
-        return NormalizeAngle180(ang);
+        ang = NormalizeAngle180(ang);
+        // Apply connection-angle offset if enabled
+        if (applyOffsetToConnectionAngles)
+            ang = NormalizeAngle180(ang + angleOffset);
+        return ang;
     }
 
     private Vector3 GetPieceCenterWorld(Transform piece)
@@ -3004,7 +3020,11 @@ AUGMENT:
         if (refForward.sqrMagnitude < 1e-6f) refForward = Vector3.right;
         refForward.Normalize();
         float ang = Vector3.SignedAngle(refForward, dirProj, planeN);
-        return NormalizeAngle180(ang);
+        ang = NormalizeAngle180(ang);
+        // Apply connection-angle offset if enabled
+        if (applyOffsetToConnectionAngles)
+            ang = NormalizeAngle180(ang + angleOffset);
+        return ang;
     }
 
     private float ComputeAveragePairwiseAngle(List<Vector3> dirs)
@@ -3522,6 +3542,11 @@ AUGMENT:
 
         float rawAngle = Mathf.Abs(Vector3.SignedAngle(pieceProj, detProj, planeNormal));
         rawAngle = NormalizeAngle180(rawAngle);
+        // Apply orientation offset if enabled
+        if (applyOffsetToOrientations)
+        {
+            rawAngle = NormalizeAngle180(rawAngle + angleOffset);
+        }
 
         // Handle symmetry per type (modulo)
         float symmetry = GetSymmetryModuloDegrees(type);
