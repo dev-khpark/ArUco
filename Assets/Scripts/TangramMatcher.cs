@@ -1402,16 +1402,8 @@ public class TangramMatcher : MonoBehaviour
                                 foreach (var p in pieces)
                                 {
                                     if (p == null) continue;
-                                    Vector3 dirP = Vector3.ProjectOnPlane(GetPieceDirectionVector(p), planeN).normalized;
-                                    if (dirP.sqrMagnitude < 1e-6f) continue;
-                                    float ang = Mathf.Abs(Vector3.SignedAngle(dirP, detDir, planeN));
-                                    ang = NormalizeAngle180(ang);
-                                    float mod2 = GetSymmetryModuloDegrees(result.shapeType);
-                                    if (mod2 > 0f)
-                                    {
-                                        ang = ang % mod2;
-                                        ang = Mathf.Min(ang, mod2 - ang);
-                                    }
+                                    // Use the unified function so angleOffset and symmetry are applied consistently
+                                    float ang = ComputeAngleError(result.shapeType, det.Value.worldRotation, p);
                                     Debug.Log($"[TangramMatcher] ORI candidate {result.shapeType}:{result.arucoId} vs diag({p.name}) | absOri={ang:F1}°");
                                 }
                             }
@@ -1731,7 +1723,12 @@ public class TangramMatcher : MonoBehaviour
                 if (connect)
                 {
                     float centerDist = Vector3.Distance(pi, pj);
-                    float angle = ComputePlanarAngleDeg(pi, pj);
+                    // Enforce low-ID -> high-ID direction for expected angle
+                    int id_i = GetArucoIdForDiagramPiece(ni.piece);
+                    int id_j = GetArucoIdForDiagramPiece(nj.piece);
+                    Vector3 fromPos = (id_i >= 0 && id_j >= 0 && id_i > id_j) ? pj : pi;
+                    Vector3 toPos   = (id_i >= 0 && id_j >= 0 && id_i > id_j) ? pi : pj;
+                    float angle = ComputePlanarAngleDeg(fromPos, toPos);
                     var edge = new DiagramGraph.Edge
                     {
                         toIndex = diagramGraph.indexByTransform[nj.piece],
@@ -1784,6 +1781,39 @@ public class TangramMatcher : MonoBehaviour
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// Returns a predefined ArUco ID for a diagram piece Transform based on its name.
+    /// This mapping must reflect the project's naming scheme.
+    /// </summary>
+    private int GetArucoIdForDiagramPiece(Transform piece)
+    {
+        if (piece == null) return -1;
+        string n = piece.name != null ? piece.name.ToLower() : "";
+        // Example mapping: adjust as needed for your naming scheme
+        if (n.Contains("triangle_l"))
+        {
+            return n.EndsWith("_2") ? 1 : 0; // LargeTriangle IDs: 0,1
+        }
+        if (n.Contains("triangle_m"))
+        {
+            return 2; // MediumTriangle ID
+        }
+        if (n.Contains("triangle_s"))
+        {
+            return n.EndsWith("_2") ? 4 : 3; // SmallTriangle IDs: 3,4
+        }
+        if (n.Contains("square"))
+        {
+            return 5; // Square ID
+        }
+        if (n.Contains("parallel") || n.Contains("parallelogram"))
+        {
+            // Parallelogram IDs could be 6,7 depending on variant; extend if needed
+            return 6;
+        }
+        return -1; // unknown
     }
 
     // ---------- Matching helpers ----------
@@ -1961,8 +1991,19 @@ public class TangramMatcher : MonoBehaviour
                                 }
                                 if (!TryComputeRelationalCostForCandidate(di, p, dg, detToPiece, out float d, out float a, out float usedScale, out int cnt))
                                     continue;
-                                bool passGating = angleOnlyForTwoDetections ? (a <= graphAngleToleranceDeg) : (d <= graphDistanceToleranceMeters && a <= graphAngleToleranceDeg);
-                                if (passGating)
+                                // Unified REL-style gating: 2-detection → (angle OR ORI), otherwise → (dist AND (angle OR ORI))
+                                float absOriDegGate = 0f;
+                                bool passOriGate = true;
+                                if (useAbsoluteOrientation)
+                                {
+                                    var detGate = latestDetections[node.detIndex];
+                                    absOriDegGate = ComputeAngleError(node.type, detGate.worldRotation, p);
+                                    passOriGate = (absOriDegGate <= absoluteOrientationToleranceDeg);
+                                }
+                                bool passDist = angleOnlyForTwoDetections ? true : (d <= graphDistanceToleranceMeters);
+                                bool passAng = (a <= graphAngleToleranceDeg);
+                                bool passes = angleOnlyForTwoDetections ? (passAng || passOriGate) : (passDist && (passAng || passOriGate));
+                                if (passes)
                                 {
                                     // Replace distance component with selected model
                                     float distanceCost2 = angleOnlyForTwoDetections ? 0f : d;
@@ -2050,22 +2091,18 @@ public class TangramMatcher : MonoBehaviour
                                         cost += scalePenalty;
                                     }
 
-                                    // Optional absolute orientation gating/cost
-                                    bool oriPassLocal = !useAbsoluteOrientation; // if ORI not used, treat as false here; we'll recompute
+                                    // Optional absolute orientation cost (do not hard-reject here; gating handled above)
+                                    bool oriPassLocal = !useAbsoluteOrientation;
                                     if (useAbsoluteOrientation)
                                     {
                                         var det = latestDetections[node.detIndex];
                                         // Use unified orientation error function to respect angleOffset and symmetry consistently
                                         float absOriDeg = ComputeAngleError(node.type, det.worldRotation, p);
-                                        if (absOriDeg > absoluteOrientationToleranceDeg)
+                                        if (absOriDeg <= absoluteOrientationToleranceDeg) oriPassLocal = true;
+                                        else if (debugLogOrientationRejections)
                                         {
-                                            if (debugLogOrientationRejections)
-                                            {
-                                                Debug.Log($"[TangramMatcher] ORI REJECT det({node.type}:{latestDetections[node.detIndex].arucoId}) -> diag({p.name}) | absOri={absOriDeg:F1}° > tol={absoluteOrientationToleranceDeg:F1}°");
-                                            }
-                                            continue;
+                                            Debug.Log($"[TangramMatcher] ORI REJECT det({node.type}:{latestDetections[node.detIndex].arucoId}) -> diag({p.name}) | absOri={absOriDeg:F1}° > tol={absoluteOrientationToleranceDeg:F1}°");
                                         }
-                                        oriPassLocal = true;
                                         if (debugLogOrientationDiff)
                                         {
                                             Debug.Log($"[TangramMatcher] ORI diff det({node.type}:{latestDetections[node.detIndex].arucoId}) -> diag({p.name}) | absOri={absOriDeg:F1}°");
@@ -3607,6 +3644,17 @@ AUGMENT:
     }
 
     /// <summary>
+    /// Computes a consistent relation angle between two detections using the 'low ArUco ID -> high ArUco ID' rule.
+    /// Uses cached 2D plane coordinates for stability.
+    /// </summary>
+    private float ComputeConsistentRelationAngle(DetectedShape shapeA, DetectedShape shapeB)
+    {
+        var fromShape = (shapeA.arucoId <= shapeB.arucoId) ? shapeA : shapeB;
+        var toShape   = (shapeA.arucoId <= shapeB.arucoId) ? shapeB : shapeA;
+        return ComputeConnectionLineAngleFromCoords(fromShape.planeCoord, toShape.planeCoord);
+    }
+
+    /// <summary>
     /// Stabilizes corner positions using exponential smoothing to reduce jitter
     /// </summary>
     private void StabilizeCornerPositions()
@@ -3938,7 +3986,7 @@ AUGMENT:
                 var A = latestDetections[i];
                 var B = latestDetections[j];
                 
-                float connectionAngle = ComputeConnectionLineAngleFromCoords(A.planeCoord, B.planeCoord);
+                float connectionAngle = ComputeConsistentRelationAngle(A, B);
                 float distance = Vector2.Distance(A.planeCoord, B.planeCoord);
                 
                 Debug.Log($"[TangramMatcher] CONNECTION det({A.shapeType}:{A.arucoId}) -> det({B.shapeType}:{B.arucoId}) | " +
@@ -3983,7 +4031,12 @@ AUGMENT:
             var e = node.edges[k];
             var neigh = diagramGraph.nodes[e.toIndex].piece;
             float actualDist = Vector3.Distance(GetPieceCenterWorld(node.piece), GetPieceCenterWorld(neigh));
-            float actualAng = ComputePlanarAngleDeg(GetPieceCenterWorld(node.piece), GetPieceCenterWorld(neigh));
+            // Use consistent low-ID->high-ID for diagnostic angle
+            int idA_dbg = GetArucoIdForDiagramPiece(node.piece);
+            int idB_dbg = GetArucoIdForDiagramPiece(neigh);
+            Vector3 from_dbg = (idA_dbg >= 0 && idB_dbg >= 0 && idA_dbg > idB_dbg) ? GetPieceCenterWorld(neigh) : GetPieceCenterWorld(node.piece);
+            Vector3 to_dbg   = (idA_dbg >= 0 && idB_dbg >= 0 && idA_dbg > idB_dbg) ? GetPieceCenterWorld(node.piece) : GetPieceCenterWorld(neigh);
+            float actualAng = ComputePlanarAngleDeg(from_dbg, to_dbg);
             float dDiff = Mathf.Abs(actualDist - e.expectedDistanceMeters);
             float aDiff = Mathf.Abs(NormalizeAngle180(actualAng - e.expectedAngleDeg));
             parts.Add($"-> '{neigh.name}' diff(d)={dDiff:F2}m diff(deg)={aDiff:F0}°");
@@ -4239,7 +4292,11 @@ AUGMENT:
             var e = node.edges[k];
             var neigh = diagramGraph.nodes[e.toIndex].piece;
             float actualDist = Vector3.Distance(GetPieceCenterWorld(node.piece), GetPieceCenterWorld(neigh));
-            float actualAng = ComputePlanarAngleDeg(GetPieceCenterWorld(node.piece), GetPieceCenterWorld(neigh));
+            int idA_dbg2 = GetArucoIdForDiagramPiece(node.piece);
+            int idB_dbg2 = GetArucoIdForDiagramPiece(neigh);
+            Vector3 from_dbg2 = (idA_dbg2 >= 0 && idB_dbg2 >= 0 && idA_dbg2 > idB_dbg2) ? GetPieceCenterWorld(neigh) : GetPieceCenterWorld(node.piece);
+            Vector3 to_dbg2   = (idA_dbg2 >= 0 && idB_dbg2 >= 0 && idA_dbg2 > idB_dbg2) ? GetPieceCenterWorld(node.piece) : GetPieceCenterWorld(neigh);
+            float actualAng = ComputePlanarAngleDeg(from_dbg2, to_dbg2);
             float dDiff = Mathf.Abs(actualDist - e.expectedDistanceMeters);
             float aDiff = Mathf.Abs(NormalizeAngle180(actualAng - e.expectedAngleDeg));
             Debug.Log($"[TangramMatcher] edge report '{node.piece.name}' -> '{neigh.name}' diff(d)={dDiff:F3}m diff(deg)={aDiff:F1} expected(d)={e.expectedDistanceMeters:F3}m expAng={e.expectedAngleDeg:F1}");
@@ -4321,7 +4378,7 @@ AUGMENT:
             float dActual = Vector2.Distance(A.planeCoord, B.planeCoord);
             
             // Calculate actual connection angle using new method
-            float actualConnectionAngle = ComputeConnectionLineAngleFromCoords(A.planeCoord, B.planeCoord);
+            float actualConnectionAngle = ComputeConsistentRelationAngle(A, B);
             Transform pA = FindAssignedPieceFor(A.shapeType, A.arucoId);
             Transform pB = FindAssignedPieceFor(B.shapeType, B.arucoId);
             if (pA != null && pB != null)
@@ -4349,7 +4406,10 @@ AUGMENT:
                 Vector2 pBCoord = ProjectTo2DCornerPlane(GetPieceCenterWorld(pB));
                 float dExp = Vector2.Distance(pACoord, pBCoord);
                 // Calculate expected connection angle using 2D projected coordinates
-                float expectedConnectionAngle = ComputeConnectionLineAngleFromCoords(pACoord, pBCoord);
+                // Enforce low-ID -> high-ID for expected angle as well
+                float expectedConnectionAngle = (A.arucoId <= B.arucoId)
+                    ? ComputeConnectionLineAngleFromCoords(pACoord, pBCoord)
+                    : ComputeConnectionLineAngleFromCoords(pBCoord, pACoord);
                 // Apply first-pass direction offset if available
                 if (useFirstPassDirectionOffset && firstPassDirOffsetValid)
                     expectedConnectionAngle = NormalizeAngle180(expectedConnectionAngle + firstPassDirOffsetDeg);
@@ -4372,7 +4432,10 @@ AUGMENT:
                     // Lock first-pass direction offset when requested and not yet set: set offset so expected+offset equals actual
                     if (useFirstPassDirectionOffset && pass && !firstPassDirOffsetValid)
                     {
-                        firstPassDirOffsetDeg = NormalizeAngle180(actualConnectionAngle - ComputeConnectionLineAngleFromCoords(pACoord, pBCoord));
+                        float baseExp = (A.arucoId <= B.arucoId)
+                            ? ComputeConnectionLineAngleFromCoords(pACoord, pBCoord)
+                            : ComputeConnectionLineAngleFromCoords(pBCoord, pACoord);
+                        firstPassDirOffsetDeg = NormalizeAngle180(actualConnectionAngle - baseExp);
                         firstPassDirOffsetValid = true;
                         firstPassDirOffsetFrame = frameCounter;
                     }
@@ -4435,7 +4498,10 @@ AUGMENT:
                         // If angle gating was ignored and overall pass achieved, lock direction offset now
                         if (useFirstPassDirectionOffset && !firstPassDirOffsetValid && pass)
                         {
-                            firstPassDirOffsetDeg = NormalizeAngle180(actualConnectionAngle - ComputeConnectionLineAngleFromCoords(pACoord, pBCoord));
+                            float baseExp2 = (A.arucoId <= B.arucoId)
+                                ? ComputeConnectionLineAngleFromCoords(pACoord, pBCoord)
+                                : ComputeConnectionLineAngleFromCoords(pBCoord, pACoord);
+                            firstPassDirOffsetDeg = NormalizeAngle180(actualConnectionAngle - baseExp2);
                             firstPassDirOffsetValid = true;
                             firstPassDirOffsetFrame = frameCounter;
                         }
@@ -4504,7 +4570,12 @@ AUGMENT:
                         // Calculate expected angle using 2D projected coordinates
                         Vector2 centerCoord = ProjectTo2DCornerPlane(GetPieceCenterWorld(centerPiece));
                         Vector2 neighCoord = ProjectTo2DCornerPlane(GetPieceCenterWorld(neighPiece));
-                        float aExpEdge = ComputeConnectionLineAngleFromCoords(centerCoord, neighCoord);
+                        // Enforce low-ID -> high-ID for expected proxy angle using diagram piece IDs
+                        int idCenter = GetArucoIdForDiagramPiece(centerPiece);
+                        int idNeigh = GetArucoIdForDiagramPiece(neighPiece);
+                        float aExpEdge = (idCenter <= idNeigh)
+                            ? ComputeConnectionLineAngleFromCoords(centerCoord, neighCoord)
+                            : ComputeConnectionLineAngleFromCoords(neighCoord, centerCoord);
                         // Baseline for normalized distances
                         float baseDet = GetDetectionMaxPairDistance();
                         float baseExp = GetDiagramMaxEdgeLength();
@@ -4528,7 +4599,9 @@ AUGMENT:
                             var detA2 = FindDetection(res.shapeType, res.arucoId);
                             var detB2 = FindDetection(mr.shapeType, mr.arucoId);
                             if (detA2.HasValue && detB2.HasValue)
-                                aAct = ComputeConnectionLineAngleFromCoords(detA2.Value.planeCoord, detB2.Value.planeCoord);
+                                aAct = (detA2.Value.arucoId <= detB2.Value.arucoId)
+                                    ? ComputeConnectionLineAngleFromCoords(detA2.Value.planeCoord, detB2.Value.planeCoord)
+                                    : ComputeConnectionLineAngleFromCoords(detB2.Value.planeCoord, detA2.Value.planeCoord);
                             else
                                 aAct = ComputeConnectionLineAngle(anchorDetPos, mr.detectionWorldPosition);
                             float dDiff = 0f;
@@ -4583,7 +4656,9 @@ AUGMENT:
                             var detA3 = FindDetection(res.shapeType, res.arucoId);
                             var detB3 = FindDetection(mr.shapeType, mr.arucoId);
                             if (detA3.HasValue && detB3.HasValue)
-                                aAct = ComputeConnectionLineAngleFromCoords(detA3.Value.planeCoord, detB3.Value.planeCoord);
+                                aAct = (detA3.Value.arucoId <= detB3.Value.arucoId)
+                                    ? ComputeConnectionLineAngleFromCoords(detA3.Value.planeCoord, detB3.Value.planeCoord)
+                                    : ComputeConnectionLineAngleFromCoords(detB3.Value.planeCoord, detA3.Value.planeCoord);
                             else
                                 aAct = ComputeConnectionLineAngle(anchorDetPos, mr.detectionWorldPosition);
                             float dDiff; float rAct=0f, rExp=0f;
@@ -4688,7 +4763,9 @@ AUGMENT:
                         Vector2 centerCoord_missing = ProjectTo2DCornerPlane(GetPieceCenterWorld(centerPiece));
                         Vector2 neighCoord_missing = ProjectTo2DCornerPlane(GetPieceCenterWorld(neighPiece));
                         float dExp = Vector2.Distance(centerCoord_missing, neighCoord_missing);
-                        float aExp = ComputeConnectionLineAngleFromCoords(centerCoord_missing, neighCoord_missing);
+                        float aExp = (GetArucoIdForDiagramPiece(centerPiece) <= GetArucoIdForDiagramPiece(neighPiece))
+                            ? ComputeConnectionLineAngleFromCoords(centerCoord_missing, neighCoord_missing)
+                            : ComputeConnectionLineAngleFromCoords(neighCoord_missing, centerCoord_missing);
                         string diagAName = centerPiece != null ? centerPiece.name : "null";
                         string diagBName = neighPiece != null ? neighPiece.name : "null";
                         relLogQueue.Add($"[TangramMatcher] REL diag({diagAName})->diag({diagBName}) | (neighbor missing) | exp d={dExp:F3}m exp deg={aExp:F1}");
@@ -4798,7 +4875,9 @@ AUGMENT:
                 var detA4 = FindDetection(res.shapeType, res.arucoId);
                 var detB4 = FindDetection(nb.Value.shapeType, nb.Value.arucoId);
                 if (detA4.HasValue && detB4.HasValue)
-                    aAct = ComputePlanarAngleFromPlaneCoords(detA4.Value.planeCoord, detB4.Value.planeCoord, 4);
+                    aAct = (detA4.Value.arucoId <= detB4.Value.arucoId)
+                        ? ComputePlanarAngleFromPlaneCoords(detA4.Value.planeCoord, detB4.Value.planeCoord, 4)
+                        : ComputePlanarAngleFromPlaneCoords(detB4.Value.planeCoord, detA4.Value.planeCoord, 4);
                 else
                     aAct = ComputePlanarAngleDeg(res.detectionWorldPosition, nb.Value.detectionWorldPosition);
                 float aExp = ed.expectedAngleDeg;
