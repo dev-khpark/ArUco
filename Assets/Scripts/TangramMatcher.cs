@@ -62,7 +62,7 @@ public class TangramMatcher : MonoBehaviour
 
     [Range(0f, 1f)]
     [Tooltip("상대 허용 비율 (0.25 = ±25%)")]
-    public float firstPassScaleTolerance = 0.25f;
+    public float firstPassScaleTolerance = 2.25f;
 
     // Internal state for first-pass relative scale
     private bool firstPassScaleValid = false;
@@ -1390,20 +1390,9 @@ public class TangramMatcher : MonoBehaviour
                     Vector3 detDir = Vector3.ProjectOnPlane(det.Value.worldRotation * Vector3.right, planeN).normalized;
                     if (detDir.sqrMagnitude > 1e-6f)
                     {
-                        // Matched piece ORI
-                        Vector3 pieceDir = Vector3.ProjectOnPlane(GetPieceDirectionVector(result.matchedPieceTransform), planeN).normalized;
-                        if (pieceDir.sqrMagnitude > 1e-6f)
-                        {
-                            float a = Mathf.Abs(Vector3.SignedAngle(pieceDir, detDir, planeN));
-                            a = NormalizeAngle180(a);
-                            float mod = GetSymmetryModuloDegrees(result.shapeType);
-                            if (mod > 0f)
-                            {
-                                a = a % mod;
-                                a = Mathf.Min(a, mod - a);
-                            }
-                            Debug.Log($"[TangramMatcher] ORI report {result.shapeType}:{result.arucoId} -> diag({result.matchedPieceTransform.name}) | absOri={a:F1}°");
-                        }
+                        // Matched piece ORI: use the precomputed angle (includes offsets/symmetry)
+                        float a = result.angleErrorDegrees;
+                        Debug.Log($"[TangramMatcher] ORI report {result.shapeType}:{result.arucoId} -> diag({result.matchedPieceTransform.name}) | absOri={a:F1}°");
                         // Also report per-candidate ORI for same-type pieces when multiple exist
                         if (diagramPiecesByType.TryGetValue(result.shapeType, out var pieces) && pieces != null)
                         {
@@ -2066,35 +2055,22 @@ public class TangramMatcher : MonoBehaviour
                                     if (useAbsoluteOrientation)
                                     {
                                         var det = latestDetections[node.detIndex];
-                                        Vector3 planeNPairs = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
-                                        Vector3 detDir = Vector3.ProjectOnPlane(det.worldRotation * Vector3.right, planeNPairs).normalized;
-                                        Vector3 pieceDir = Vector3.ProjectOnPlane(GetPieceDirectionVector(p), planeNPairs).normalized;
-                                        if (detDir.sqrMagnitude > 1e-6f && pieceDir.sqrMagnitude > 1e-6f)
+                                        // Use unified orientation error function to respect angleOffset and symmetry consistently
+                                        float absOriDeg = ComputeAngleError(node.type, det.worldRotation, p);
+                                        if (absOriDeg > absoluteOrientationToleranceDeg)
                                         {
-                                            float absOriDeg = Mathf.Abs(Vector3.SignedAngle(pieceDir, detDir, planeNPairs));
-                                            absOriDeg = NormalizeAngle180(absOriDeg);
-                                            float mod = GetSymmetryModuloDegrees(node.type);
-                                            if (mod > 0f)
+                                            if (debugLogOrientationRejections)
                                             {
-                                                absOriDeg = absOriDeg % mod;
-                                                absOriDeg = Mathf.Min(absOriDeg, mod - absOriDeg);
+                                                Debug.Log($"[TangramMatcher] ORI REJECT det({node.type}:{latestDetections[node.detIndex].arucoId}) -> diag({p.name}) | absOri={absOriDeg:F1}° > tol={absoluteOrientationToleranceDeg:F1}°");
                                             }
-                                            if (absOriDeg > absoluteOrientationToleranceDeg)
-                                            {
-                                                // Reject candidate if outside tolerance
-                                                if (debugLogOrientationRejections)
-                                                {
-                                                    Debug.Log($"[TangramMatcher] ORI REJECT det({node.type}:{latestDetections[node.detIndex].arucoId}) -> diag({p.name}) | absOri={absOriDeg:F1}° > tol={absoluteOrientationToleranceDeg:F1}°");
-                                                }
-                                                continue;
-                                            }
-                                            oriPassLocal = true;
-                                            if (debugLogOrientationDiff)
-                                            {
-                                                Debug.Log($"[TangramMatcher] ORI diff det({node.type}:{latestDetections[node.detIndex].arucoId}) -> diag({p.name}) | absOri={absOriDeg:F1}°");
-                                            }
-                                            cost += absoluteOrientationWeightMetersPerDeg * absOriDeg;
+                                            continue;
                                         }
+                                        oriPassLocal = true;
+                                        if (debugLogOrientationDiff)
+                                        {
+                                            Debug.Log($"[TangramMatcher] ORI diff det({node.type}:{latestDetections[node.detIndex].arucoId}) -> diag({p.name}) | absOri={absOriDeg:F1}°");
+                                        }
+                                        cost += absoluteOrientationWeightMetersPerDeg * absOriDeg;
                                     }
                                     // If relation angle or ORI passes, prefer nearest diagram piece by absolute planar distance
                                     bool anglePassLocal = (a <= graphAngleToleranceDeg);
@@ -2331,33 +2307,20 @@ public class TangramMatcher : MonoBehaviour
                     if (useAbsoluteOrientation)
                     {
                         var det = latestDetections[node.detIndex];
-                        Vector3 planeNCand = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
-                        Vector3 detDir = Vector3.ProjectOnPlane(det.worldRotation * Vector3.right, planeNCand).normalized;
-                        Vector3 pieceDir = Vector3.ProjectOnPlane(GetPieceDirectionVector(p), planeNCand).normalized;
-                        if (detDir.sqrMagnitude > 1e-6f && pieceDir.sqrMagnitude > 1e-6f)
+                        float absOriDeg = ComputeAngleError(node.type, det.worldRotation, p);
+                        if (absOriDeg > absoluteOrientationToleranceDeg)
                         {
-                            float absOriDeg = Mathf.Abs(Vector3.SignedAngle(pieceDir, detDir, planeNCand));
-                            absOriDeg = NormalizeAngle180(absOriDeg);
-                            float mod = GetSymmetryModuloDegrees(node.type);
-                            if (mod > 0f)
+                            if (debugLogOrientationRejections)
                             {
-                                absOriDeg = absOriDeg % mod;
-                                absOriDeg = Mathf.Min(absOriDeg, mod - absOriDeg);
+                                Debug.Log($"[TangramMatcher] ORI REJECT det({node.type}:{latestDetections[node.detIndex].arucoId}) -> diag({p.name}) | absOri={absOriDeg:F1}° > tol={absoluteOrientationToleranceDeg:F1}°");
                             }
-                            if (absOriDeg > absoluteOrientationToleranceDeg)
-                            {
-                                if (debugLogOrientationRejections)
-                                {
-                                    Debug.Log($"[TangramMatcher] ORI REJECT det({node.type}:{latestDetections[node.detIndex].arucoId}) -> diag({p.name}) | absOri={absOriDeg:F1}° > tol={absoluteOrientationToleranceDeg:F1}°");
-                                }
-                                continue;
-                            }
-                            if (debugLogOrientationDiff)
-                            {
-                                Debug.Log($"[TangramMatcher] ORI diff det({node.type}:{latestDetections[node.detIndex].arucoId}) -> diag({p.name}) | absOri={absOriDeg:F1}°");
-                            }
-                            bestLocalCost += absoluteOrientationWeightMetersPerDeg * absOriDeg;
+                            continue;
                         }
+                        if (debugLogOrientationDiff)
+                        {
+                            Debug.Log($"[TangramMatcher] ORI diff det({node.type}:{latestDetections[node.detIndex].arucoId}) -> diag({p.name}) | absOri={absOriDeg:F1}°");
+                        }
+                        bestLocalCost += absoluteOrientationWeightMetersPerDeg * absOriDeg;
                     }
 
                     if (preferPreviousAssignment)
@@ -3540,13 +3503,14 @@ AUGMENT:
         if (detProj.sqrMagnitude < 1e-6f || pieceProj.sqrMagnitude < 1e-6f)
             return 0f;
 
-        float rawAngle = Mathf.Abs(Vector3.SignedAngle(pieceProj, detProj, planeNormal));
-        rawAngle = NormalizeAngle180(rawAngle);
+        float rawAngle = Vector3.SignedAngle(pieceProj, detProj, planeNormal);
+        // Normalize later after applying offset
         // Apply orientation offset if enabled
         if (applyOffsetToOrientations)
         {
-            rawAngle = NormalizeAngle180(rawAngle + angleOffset);
+            rawAngle = rawAngle + angleOffset;
         }
+        rawAngle = NormalizeAngle180(rawAngle);
 
         // Handle symmetry per type (modulo)
         float symmetry = GetSymmetryModuloDegrees(type);
@@ -3614,8 +3578,10 @@ AUGMENT:
         // In Unity, Z acts as Y in 2D coordinate system
         float angleRad = Mathf.Atan2(dirProj.z, dirProj.x);
         float angleDeg = angleRad * Mathf.Rad2Deg;
-        
-        return NormalizeAngle180(angleDeg);
+        angleDeg = NormalizeAngle180(angleDeg);
+        if (applyOffsetToConnectionAngles)
+            angleDeg = NormalizeAngle180(angleDeg + angleOffset);
+        return angleDeg;
     }
 
     /// <summary>
@@ -3634,8 +3600,10 @@ AUGMENT:
         
         float angleRad = Mathf.Atan2(deltaY, deltaX);
         float angleDeg = angleRad * Mathf.Rad2Deg;
-        
-        return NormalizeAngle180(angleDeg);
+        angleDeg = NormalizeAngle180(angleDeg);
+        if (applyOffsetToConnectionAngles)
+            angleDeg = NormalizeAngle180(angleDeg + angleOffset);
+        return angleDeg;
     }
 
     /// <summary>
@@ -4471,7 +4439,7 @@ AUGMENT:
                             firstPassDirOffsetValid = true;
                             firstPassDirOffsetFrame = frameCounter;
                         }
-                        relLogQueue.Add($"[TangramMatcher] REL det({A.shapeType}:{A.arucoId})->det({B.shapeType}:{B.arucoId}) | diag({diagAName})->diag({diagBName}) | relErr={(firstPassScaleValid ? relErr : float.NaN):F3} tol±{(firstPassScaleTolerance * 100f):F0}% s={(firstPassScaleValid ? firstPassScale : float.NaN):F3} | Dist={(passDist?"PASS":"FAIL")} Angle={(passConnectionAngle?"PASS":"FAIL")} Ori={(passOri?"PASS":"FAIL")} | connectionAngle={actualConnectionAngle:F1}° (tol {relationMaxAngleDiffDeg:F1}) | ORI_A={oriA:F1}° ORI_B={oriB:F1}° (tol {absoluteOrientationToleranceDeg:F1}) | A2D=({A.planeCoord.x:F2},{A.planeCoord.y:F2}) B2D=({B.planeCoord.x:F2},{B.planeCoord.y:F2}) | {(pass ? "PASS" : "FAIL")}");
+                        relLogQueue.Add($"[TangramMatcher] REL det({A.shapeType}:{A.arucoId})->det({B.shapeType}:{B.arucoId}) | diag({diagAName})->diag({diagBName}) | relErr={(firstPassScaleValid ? relErr : float.NaN):F3} tol±{(firstPassScaleTolerance * 100f):F0}% s={(firstPassScaleValid ? firstPassScale : float.NaN):F3} | Dist={(passDist?"PASS":"FAIL")} Angle={(passConnectionAngle?"PASS":"FAIL")} Ori={(passOri?"PASS":"FAIL")} | connectionAngle={actualConnectionAngle:F1}° exp={expectedConnectionAngle:F1}° Δangle={connectionAngleDiff:F1}° (tol {relationMaxAngleDiffDeg:F1}) | ORI_A={oriA:F1}° ORI_B={oriB:F1}° (tol {absoluteOrientationToleranceDeg:F1}) | A2D=({A.planeCoord.x:F2},{A.planeCoord.y:F2}) B2D=({B.planeCoord.x:F2},{B.planeCoord.y:F2}) | {(pass ? "PASS" : "FAIL")}");
                     }
                     else if (useNormalizedRelationDistance)
                     {
