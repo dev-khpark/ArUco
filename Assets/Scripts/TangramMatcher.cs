@@ -42,6 +42,15 @@ public class TangramMatcher : MonoBehaviour
     public float maxAngleErrorDegrees = 45f;
     [Tooltip("Weight converting rotation error (degrees) into meters for matching cost. cost = distance(m) + rotationWeightMetersPerDeg * angle(deg)")]
     public float rotationWeightMetersPerDeg = 0.01f;
+
+    [Tooltip("한 조각이 여러 이웃 관계 중 첫 번째 'PASS' 관계를 만족하면 즉시 매칭을 확정합니다.")]
+    public bool matchOnFirstPassingRelation = true;
+
+    [Tooltip("직전 프레임에 매칭됐던 조각이 잠시 매칭에 실패하는 경우(Flicker), 'MATCH FAILED' 경고를 억제합니다.")]
+    public bool suppressFlickerWarnings = true;
+
+    // 직전 프레임에 매칭되었던 조각들을 추적하기 위한 변수
+    private readonly HashSet<Transform> _matchedPiecesLastFrame = new HashSet<Transform>();
     // Anchor-relative matching removed
 
     [Header("Distance Cost Model")]
@@ -396,7 +405,7 @@ public class TangramMatcher : MonoBehaviour
     [Tooltip("Confidence threshold to unlock a previously locked piece.")]
     public float unlockConfidenceThreshold = 0.2f;
     [Tooltip("Max distance to re-associate a detection to a locked piece (meters).")]
-    public float relockMaxDistanceMeters = 1.2f;
+    public float relockMaxDistanceMeters = 1.5f;
 
     /// <summary>
     /// Types of Tangram shapes supported.
@@ -1450,6 +1459,13 @@ public class TangramMatcher : MonoBehaviour
         // Update cached baselines ONCE per frame after matching
         UpdateCachedBaselinesFromLastResults();
 
+        // 현재 프레임의 매칭 결과를 다음 프레임의 경고 억제에 사용하기 위해 저장
+        _matchedPiecesLastFrame.Clear();
+        foreach (var result in lastMatchResults)
+        {
+            _matchedPiecesLastFrame.Add(result.matchedPieceTransform);
+        }
+
         // Debug log in English for clarity
         foreach (var result in lastMatchResults)
         {
@@ -2327,103 +2343,72 @@ public class TangramMatcher : MonoBehaviour
             {
                 // Relational cost using the BEST (lowest-cost) relation among matched neighbors that are connected in the diagram graph
                 var nearMissList = new List<(Transform p, float avgDistDiff, float avgAngDiff, float cost)>();
-                
-                // ★ 핵심 수정: 단 하나의 관계라도 성공하면 즉시 매칭
-                foreach (var p in filteredCandidates) // p는 다이어그램 조각 후보
+
+                if (matchOnFirstPassingRelation)
                 {
-                    // 이 후보(p)가 연결된 이웃 조각들 중, 이미 매칭된 조각과의 관계를 하나씩 검사합니다.
-                    foreach (int nIdx in node.neighbors)
+                    foreach (var p in filteredCandidates)
                     {
-                        if (!detToPiece.TryGetValue(nIdx, out var neighborPiece)) continue; // 이웃 탐지가 아직 매칭되지 않았으면 건너뛰기
-
-                        // 관계 검사가 필요한 diagram edge인지 확인 (옵션)
-                        if (restrictRelationsToGraphEdges)
+                        if (TryComputeRelationalCostForCandidate(nodeIdx, p, dg, detToPiece, out float d, out float a, out float usedScale, out int cnt))
                         {
-                            if (!diagramGraph.indexByTransform.TryGetValue(p, out int ip)) continue;
-                            if (!diagramGraph.indexByTransform.TryGetValue(neighborPiece, out int inb)) continue;
-                            if (!IsDiagramEdge(ip, inb)) continue;
-                        }
+                            bool passDist = d <= _dynamicGraphDistanceTolerance;
+                            bool passAng = a <= graphAngleToleranceDeg;
+                            bool passOri = !useAbsoluteOrientation || ComputeAngleError(node.type, latestDetections[node.detIndex].worldRotation, p) <= absoluteOrientationToleranceDeg;
+                            bool pass = angleOnlyForTwoDetections ? (passAng || passOri) : (passDist && (passAng || passOri));
 
-                        // '후보(p)'와 '매칭된 이웃(neighborPiece)' 간의 관계 비용을 계산합니다.
-                        Vector3 vDet = dg.nodes[nIdx].pos - node.pos;
-                        Vector3 vDiag = GetPieceCenterWorld(neighborPiece) - GetPieceCenterWorld(p);
-                        if (usePlanarProjectionForRelations)
-                        {
-                            Vector3 nrm = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
-                            vDet = Vector3.ProjectOnPlane(vDet, nrm);
-                            vDiag = Vector3.ProjectOnPlane(vDiag, nrm);
-                        }
-                        float scaleFactor = 1f;
-                        if (useScaleNormalization && vDiag.magnitude > 1e-4f)
-                            scaleFactor = vDet.magnitude / vDiag.magnitude;
-
-                        Vector3 planeN = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
-                        Vector3 vDetP = Vector3.ProjectOnPlane(vDet, planeN);
-                        Vector3 vDiagP = Vector3.ProjectOnPlane(vDiag, planeN);
-                        float distDiff = Mathf.Abs(vDetP.magnitude - vDiagP.magnitude * scaleFactor);
-                        if (useNormalizedRelationDistance)
-                        {
-                            if (useSubsetUnifiedBaseline)
+                            if (pass)
                             {
-                                if (cachedBaselineValid)
-                                {
-                                    float ratioDet = vDetP.magnitude / Mathf.Max(1e-4f, cachedBaselineDetRef);
-                                    float ratioDiag = (vDiagP.magnitude * scaleFactor) / Mathf.Max(1e-4f, cachedBaselineExpRef);
-                                    distDiff = Mathf.Abs(ratioDet - ratioDiag);
-                                }
-                                else
-                                {
-                                    float detRef, expRef;
-                                    if (!TryGetSubsetReferenceBaselines(dg, detToPiece, out detRef, out expRef))
-                                    {
-                                        detRef = Mathf.Max(1e-4f, GetCurrentMatchedSubsetMaxDetectionEdgeDistance(dg, detToPiece));
-                                        expRef = Mathf.Max(1e-4f, GetCurrentMatchedSubsetMaxDiagramEdgeExpected(detToPiece));
-                                    }
-                                    float ratioDet = vDetP.magnitude / Mathf.Max(1e-4f, detRef);
-                                    float ratioDiag = (vDiagP.magnitude * scaleFactor) / Mathf.Max(1e-4f, expRef);
-                                    distDiff = Mathf.Abs(ratioDet - ratioDiag);
-                                }
+                                chosen = p;
+                                chosenCost = 0f;
+                                chosenAvgDistDiff = d;
+                                chosenAvgAngDiff = a;
+                                goto CandidateChosen;
                             }
                             else
                             {
-                                float baseline = Vector3.Distance(GetPieceCenterWorld(neighborPiece), GetPieceCenterWorld(p));
-                                if (baseline > 1e-4f)
-                                {
-                                    float ratioDet = vDetP.magnitude / baseline;
-                                    float ratioDiag = (vDiagP.magnitude * scaleFactor) / baseline;
-                                    distDiff = Mathf.Abs(ratioDet - ratioDiag);
-                                }
+                                nearMissList.Add((p, d, a, d + a * rotationWeightMetersPerDeg));
                             }
                         }
-                        float angDiff = Mathf.Abs(Mathf.DeltaAngle(0f, Vector3.SignedAngle(vDetP.normalized, vDiagP.normalized, planeN)));
+                    }
+                CandidateChosen:;
+                }
+                else
+                {
+                    // Legacy best-fit logic can be implemented here if needed.
+                }
 
-                        // 오차 허용치를 확인합니다.
-                        bool passDist = distDiff <= _dynamicGraphDistanceTolerance;
-                        bool passAng = angDiff <= graphAngleToleranceDeg;
-                        bool passOri = true;
-                        if (useAbsoluteOrientation)
+                // If no candidate was chosen, record the reason for the best near-miss.
+                if (chosen == null && nearMissList.Count > 0)
+                {
+                    nearMissList.Sort((a, b) => a.cost.CompareTo(b.cost));
+                    var bestFail = nearMissList[0];
+                    string failureReason = "";
+
+                    if (bestFail.avgDistDiff > _dynamicGraphDistanceTolerance)
+                    {
+                        failureReason = $"vs '{bestFail.p.name}': Relational distance error ({bestFail.avgDistDiff:F3}m) > tolerance ({_dynamicGraphDistanceTolerance:F3}m).";
+                    }
+                    else if (bestFail.avgAngDiff > graphAngleToleranceDeg)
+                    {
+                        failureReason = $"vs '{bestFail.p.name}': Relational angle error ({bestFail.avgAngDiff:F1}°) > tolerance ({graphAngleToleranceDeg:F1}°).";
+                    }
+                    else if (useAbsoluteOrientation)
+                    {
+                        var det = latestDetections[node.detIndex];
+                        float absOriDeg = ComputeAngleError(node.type, det.worldRotation, bestFail.p);
+                        if (absOriDeg > absoluteOrientationToleranceDeg)
                         {
-                            var det = latestDetections[node.detIndex];
-                            float absOriDeg = ComputeAngleError(node.type, det.worldRotation, p);
-                            passOri = (absOriDeg <= absoluteOrientationToleranceDeg);
+                            failureReason = $"vs '{bestFail.p.name}': Absolute orientation error ({absOriDeg:F1}°) > tolerance ({absoluteOrientationToleranceDeg:F1}°).";
                         }
+                    }
 
-                        // ★ 핵심 수정: 거리, 각도, 방향 중 하나라도 통과하면 즉시 성공으로 간주하고 루프를 탈출합니다.
-                        // (2개 탐지 모드에서는 각도 또는 방향만 확인)
-                        bool pass = angleOnlyForTwoDetections ? (passAng || passOri) : (passDist && (passAng || passOri));
-
-                        if (pass)
+                    if (!string.IsNullOrEmpty(failureReason))
+                    {
+                        if (preAssignedDetections.TryGetValue(node.detIndex, out var lockedPieceForThisDet) && lockedPieceForThisDet != null)
                         {
-                            // 첫 번째 성공적인 관계를 찾았으므로 이 후보를 선택하고 더 이상 검사하지 않습니다.
-                            chosen = p;
-                            chosenCost = 0f; // 비용은 더 이상 중요하지 않으므로 0으로 설정
-                            chosenAvgDistDiff = distDiff;
-                            chosenAvgAngDiff = angDiff;
-                            goto CandidateChosen; // 루프 탈출
+                            _detailedFailureReasons[lockedPieceForThisDet.name] = failureReason;
                         }
                     }
                 }
-                CandidateChosen:; // 루프 탈출 지점
                 if (debugLogUnmatchedCandidates && nearMissList.Count > 0)
                 {
                     nearMissList.Sort((a, b) => a.cost.CompareTo(b.cost));
@@ -2544,8 +2529,7 @@ public class TangramMatcher : MonoBehaviour
                         relationPass = EvaluateRelationPassForPiece(ls.piece, relationLockRequireAllNeighbors, out string reason);
                         if (debugLogLockRelationDecision)
                         {
-                            Debug.Log($"[TangramMatcher] LOCK-REL {ls.piece.name} pass={(relationPass?1:0)} all={(relationLockRequireAllNeighbors?1:0)} {reason}");
-                        }
+                            Debug.Log("[TangramMatcher] LOCK-REL " + ls.piece.name + " pass=" + (relationPass ? 1 : 0) + " all=" + (relationLockRequireAllNeighbors ? 1 : 0) + " " + reason);}
                     }
                     if (relationPass)
                     {
@@ -2590,120 +2574,131 @@ public class TangramMatcher : MonoBehaviour
                             }
                             else
                             {
-                                string reason = "A detection existed but failed relational checks (incorrect position relative to neighbors).";
-                                if (!_detailedFailureReasons.TryGetValue(ls.piece.name, out var detailedReason))
+                                if (suppressFlickerWarnings && _matchedPiecesLastFrame.Contains(ls.piece))
                                 {
-                                    // Fallback: derive a detailed reason on-the-fly using nearest detection and matched neighbors
-                                    // 1) Find nearest detection of the same type (planar distance)
-                                    int detIdx = -1; float bestAbs = float.PositiveInfinity; Vector3 nearestDetPos = Vector3.zero; Quaternion nearestDetRot = Quaternion.identity;
-                                    Vector3 centerLs = GetPieceCenterWorld(ls.piece);
-                                    Vector3 planeN = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
-                                    for (int i = 0; i < latestDetections.Count; i++)
-                                    {
-                                        var d = latestDetections[i];
-                                        if (d.isCorner || d.shapeType != ls.type) continue;
-                                        Vector3 vAbs = Vector3.ProjectOnPlane(d.worldPosition - centerLs, planeN);
-                                        float m = vAbs.magnitude;
-                                        if (m < bestAbs) { bestAbs = m; detIdx = i; nearestDetPos = d.worldPosition; nearestDetRot = d.worldRotation; }
-                                    }
-                                    if (detIdx >= 0)
-                                    {
-                                        // 2) Compare relations against matched diagram neighbors
-                                        float bestLocalCost = float.PositiveInfinity;
-                                        float bestLocalDist = 0f;
-                                        float bestLocalAng = 0f;
-                                        if (diagramGraph != null && diagramGraph.indexByTransform.TryGetValue(ls.piece, out int ipiece))
-                                        {
-                                            foreach (var e in diagramGraph.nodes[ipiece].edges)
-                                            {
-                                                var neighPiece = diagramGraph.nodes[e.toIndex].piece;
-                                                // Find detection matched to neighPiece this frame
-                                                Vector3 neighDetPos = Vector3.zero;
-                                                bool neighMatched = false;
-                                                foreach (var r in lastMatchResults)
-                                                {
-                                                    if (r.matchedPieceTransform == neighPiece)
-                                                    {
-                                                        neighDetPos = r.detectionWorldPosition;
-                                                        neighMatched = true; break;
-                                                    }
-                                                }
-                                                if (!neighMatched) continue;
-
-                                                Vector3 vDet = neighDetPos - nearestDetPos;
-                                                Vector3 vDiag = GetPieceCenterWorld(neighPiece) - centerLs;
-                                                Vector3 vDetP = Vector3.ProjectOnPlane(vDet, planeN);
-                                                Vector3 vDiagP = Vector3.ProjectOnPlane(vDiag, planeN);
-                                                float scaleFactor = 1f;
-                                                if (useScaleNormalization && vDiagP.magnitude > 1e-4f)
-                                                    scaleFactor = vDetP.magnitude / vDiagP.magnitude;
-                                                float distDiff;
-                                                if (useNormalizedRelationDistance)
-                                                {
-                                                    float baseline = Vector3.Distance(GetPieceCenterWorld(neighPiece), centerLs);
-                                                    if (baseline > 1e-4f)
-                                                    {
-                                                        float ratioDet = vDetP.magnitude / baseline;
-                                                        float ratioDiag = (vDiagP.magnitude * scaleFactor) / baseline;
-                                                        distDiff = Mathf.Abs(ratioDet - ratioDiag);
-                                                    }
-                                                    else distDiff = 0f;
-                                                }
-                                                else
-                                                {
-                                                    distDiff = Mathf.Abs(vDetP.magnitude - vDiagP.magnitude * scaleFactor);
-                                                }
-                                                float angDiff = Mathf.Abs(Mathf.DeltaAngle(0f, Vector3.SignedAngle(vDetP.normalized, vDiagP.normalized, planeN)));
-                                                float cost = distDiff + rotationWeightMetersPerDeg * angDiff;
-                                                if (cost < bestLocalCost)
-                                                {
-                                                    bestLocalCost = cost; bestLocalDist = distDiff; bestLocalAng = angDiff;
-                                                }
-                                            }
-                                        }
-                                        // Decide reason based on best relation and/or absolute orientation
-                                        if (!float.IsPositiveInfinity(bestLocalCost))
-                                        {
-                                            if (bestLocalDist > _dynamicGraphDistanceTolerance)
-                                            {
-                                                detailedReason = $"Relational check failed. Distance error ({bestLocalDist:F3}m) exceeded tolerance ({_dynamicGraphDistanceTolerance:F3}m).";
-                                            }
-                                            else if (bestLocalAng > graphAngleToleranceDeg)
-                                            {
-                                                detailedReason = $"Relational check failed. Angle error ({bestLocalAng:F1}°) exceeded tolerance ({graphAngleToleranceDeg:F1}°).";
-                                            }
-                                        }
-                                        // Absolute-orientation based reason, if enabled
-                                        if (string.IsNullOrEmpty(detailedReason) && useAbsoluteOrientation)
-                                        {
-                                            float absOriDeg = ComputeAngleError(ls.type, nearestDetRot, ls.piece);
-                                            if (absOriDeg > absoluteOrientationToleranceDeg)
-                                            {
-                                                detailedReason = $"Relational check failed. Orientation error ({absOriDeg:F1}°) exceeded tolerance ({absoluteOrientationToleranceDeg:F1}°).";
-                                            }
-                                        }
-                                        // Absolute distance fallback as a last resort
-                                        if (string.IsNullOrEmpty(detailedReason))
-                                        {
-                                            Vector3 vAbsP = Vector3.ProjectOnPlane(nearestDetPos - centerLs, planeN);
-                                            float absDist = vAbsP.magnitude;
-                                            if (absDist > _dynamicGraphDistanceTolerance)
-                                            {
-                                                detailedReason = $"Absolute distance too large. Distance error ({absDist:F3}m) exceeded tolerance ({_dynamicGraphDistanceTolerance:F3}m).";
-                                            }
-                                        }
-                                    }
-                                    if (!string.IsNullOrEmpty(detailedReason))
-                                    {
-                                        _detailedFailureReasons[ls.piece.name] = detailedReason;
-                                        reason = detailedReason;
-                                    }
+                                    // 직전 프레임에 매칭됐던 조각이면 경고를 건너뜁니다 (Flicker 억제).
                                 }
                                 else
                                 {
-                                    reason = detailedReason;
+                                    string reason = "A detection existed but failed relational checks (incorrect position relative to neighbors).";
+                                    if (!_detailedFailureReasons.TryGetValue(ls.piece.name, out var detailedReason))
+                                    {
+                                        // Fallback: derive a detailed reason on-the-fly using nearest detection and matched neighbors
+                                        // 1) Find nearest detection of the same type (planar distance)
+                                        int detIdx = -1; float bestAbs = float.PositiveInfinity; Vector3 nearestDetPos = Vector3.zero; Quaternion nearestDetRot = Quaternion.identity;
+                                        Vector3 centerLs = GetPieceCenterWorld(ls.piece);
+                                        Vector3 planeN = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
+                                        for (int i = 0; i < latestDetections.Count; i++)
+                                        {
+                                            var d = latestDetections[i];
+                                            if (d.isCorner || d.shapeType != ls.type) continue;
+                                            Vector3 vAbs = Vector3.ProjectOnPlane(d.worldPosition - centerLs, planeN);
+                                            float m = vAbs.magnitude;
+                                            if (m < bestAbs) { bestAbs = m; detIdx = i; nearestDetPos = d.worldPosition; nearestDetRot = d.worldRotation; }
+                                        }
+                                        if (detIdx >= 0)
+                                        {
+                                            // 2) Compare relations against matched diagram neighbors
+                                            float bestLocalCost = float.PositiveInfinity;
+                                            float bestLocalDist = 0f;
+                                            float bestLocalAng = 0f;
+                                            Transform bestFailNeighbor = null;
+
+                                            if (diagramGraph != null && diagramGraph.indexByTransform.TryGetValue(ls.piece, out int ipiece))
+                                            {
+                                                foreach (var e in diagramGraph.nodes[ipiece].edges)
+                                                {
+                                                    var neighPiece = diagramGraph.nodes[e.toIndex].piece;
+                                                    // Find detection matched to neighPiece this frame
+                                                    Vector3 neighDetPos = Vector3.zero;
+                                                    bool neighMatched = false;
+                                                    foreach (var r in lastMatchResults)
+                                                    {
+                                                        if (r.matchedPieceTransform == neighPiece)
+                                                        {
+                                                            neighDetPos = r.detectionWorldPosition;
+                                                            neighMatched = true; break;
+                                                        }
+                                                    }
+                                                    if (!neighMatched) continue;
+
+                                                    Vector3 vDet = neighDetPos - nearestDetPos;
+                                                    Vector3 vDiag = GetPieceCenterWorld(neighPiece) - centerLs;
+                                                    Vector3 vDetP = Vector3.ProjectOnPlane(vDet, planeN);
+                                                    Vector3 vDiagP = Vector3.ProjectOnPlane(vDiag, planeN);
+                                                    float scaleFactor = 1f;
+                                                    if (useScaleNormalization && vDiagP.magnitude > 1e-4f)
+                                                        scaleFactor = vDetP.magnitude / vDiagP.magnitude;
+                                                    float distDiff;
+                                                    if (useNormalizedRelationDistance)
+                                                    {
+                                                        float baseline = Vector3.Distance(GetPieceCenterWorld(neighPiece), centerLs);
+                                                        if (baseline > 1e-4f)
+                                                        {
+                                                            float ratioDet = vDetP.magnitude / baseline;
+                                                            float ratioDiag = (vDiagP.magnitude * scaleFactor) / baseline;
+                                                            distDiff = Mathf.Abs(ratioDet - ratioDiag);
+                                                        }
+                                                        else distDiff = 0f;
+                                                    }
+                                                    else
+                                                    {
+                                                        distDiff = Mathf.Abs(vDetP.magnitude - vDiagP.magnitude * scaleFactor);
+                                                    }
+                                                    float angDiff = Mathf.Abs(Mathf.DeltaAngle(0f, Vector3.SignedAngle(vDetP.normalized, vDiagP.normalized, planeN)));
+                                                    float cost = distDiff + rotationWeightMetersPerDeg * angDiff;
+                                                    if (cost < bestLocalCost)
+                                                    {
+                                                        bestLocalCost = cost; bestLocalDist = distDiff; bestLocalAng = angDiff;
+                                                        bestFailNeighbor = neighPiece;
+                                                    }
+                                                }
+                                            }
+                                            // Decide reason based on best relation and/or absolute orientation
+                                            if (!float.IsPositiveInfinity(bestLocalCost))
+                                            {
+                                                string neighborName = bestFailNeighbor != null ? bestFailNeighbor.name : "unknown";
+                                                if (bestLocalDist > _dynamicGraphDistanceTolerance)
+                                                {
+                                                    detailedReason = $"vs '{neighborName}': Relational distance error ({bestLocalDist:F3}m) > tolerance ({_dynamicGraphDistanceTolerance:F3}m).";
+                                                }
+                                                else if (bestLocalAng > graphAngleToleranceDeg)
+                                                {
+                                                    detailedReason = $"vs '{neighborName}': Relational angle error ({bestLocalAng:F1}°) > tolerance ({graphAngleToleranceDeg:F1}°).";
+                                                }
+                                            }
+                                            // Absolute-orientation based reason, if enabled
+                                            if (string.IsNullOrEmpty(detailedReason) && useAbsoluteOrientation)
+                                            {
+                                                float absOriDeg = ComputeAngleError(ls.type, nearestDetRot, ls.piece);
+                                                if (absOriDeg > absoluteOrientationToleranceDeg)
+                                                {
+                                                    detailedReason = $"Absolute orientation error ({absOriDeg:F1}°) > tolerance ({absoluteOrientationToleranceDeg:F1}°).";
+                                                }
+                                            }
+                                            // Absolute distance fallback as a last resort
+                                            if (string.IsNullOrEmpty(detailedReason))
+                                            {
+                                                Vector3 vAbsP = Vector3.ProjectOnPlane(nearestDetPos - centerLs, planeN);
+                                                float absDist = vAbsP.magnitude;
+                                                if (absDist > relockMaxDistanceMeters) // Use relock distance for a more relevant fallback
+                                                {
+                                                    detailedReason = $"Absolute distance to nearest detection ({absDist:F3}m) > tolerance ({relockMaxDistanceMeters:F3}m).";
+                                                }
+                                            }
+                                        }
+                                        if (!string.IsNullOrEmpty(detailedReason))
+                                        {
+                                            _detailedFailureReasons[ls.piece.name] = detailedReason;
+                                            reason = detailedReason;
+                                        }
+                                    }
+                                    else
+                                    {
+                                        reason = detailedReason;
+                                    }
+                                    Debug.LogWarning($"[TangramMatcher] MATCH FAILED for locked piece '{ls.piece.name}'. Cause: {reason}");
                                 }
-                                Debug.LogWarning($"[TangramMatcher] MATCH FAILED for locked piece '{ls.piece.name}'. Cause: {reason}");
                             }
                         }
                     }
