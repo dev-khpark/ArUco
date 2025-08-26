@@ -5391,17 +5391,92 @@ AUGMENT:
     {
         try
         {
-            if (piece == null) return string.Empty;
+            if (piece == null) return "no-piece";
             Vector3 n = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
 
-            // Nearest detection of same type
+            // Base metrics: last successful detection vs current nearest
+            Vector3 pieceCenter = GetPieceCenterWorld(piece);
+            Vector2 pieceCenter2D = ProjectTo2DCornerPlane(pieceCenter);
+
+            // Find nearest detection of the same type
             int detIdx = -1; float best = float.PositiveInfinity;
             for (int i = 0; i < latestDetections.Count; i++)
             {
                 var d = latestDetections[i];
                 if (d.isCorner || d.shapeType != type) continue;
-                float dist = Vector3.ProjectOnPlane(d.worldPosition - piece.position, n).magnitude;
+                float dist = Vector3.ProjectOnPlane(d.worldPosition - pieceCenter, n).magnitude;
                 if (dist < best) { best = dist; detIdx = i; }
+            }
+
+            // Try to get last successful detection for this piece
+            Vector3 lastDetW = pieceCenter;
+            float lastPlanar = -1f;
+            if (lockedByPiece != null && lockedByPiece.TryGetValue(piece, out var ls0) && ls0.lastDetSeenFrame >= 0)
+            {
+                lastDetW = ls0.lastDetWorldPosition;
+                lastPlanar = Vector3.ProjectOnPlane(lastDetW - pieceCenter, n).magnitude; // just an info
+            }
+
+            List<string> parts = new List<string>();
+
+            if (detIdx >= 0)
+            {
+                // Current nearest detection planar distance to last successful detection (if any), else to piece center
+                var detNow = latestDetections[detIdx];
+                float planarToLast = Vector3.ProjectOnPlane(detNow.worldPosition - (lastPlanar >= 0f ? lastDetW : pieceCenter), n).magnitude;
+                parts.Add("planarDist=" + planarToLast.ToString("F3") + "m (<= " + relockMaxDistanceMeters.ToString("F3") + "m)");
+            }
+            else
+            {
+                parts.Add("no same-type detection (latest=" + latestDetections.Count + ")");
+            }
+
+            // Neighbor details (only if verbose flag is true)
+            if (verboseRelationalFailureLogs && detIdx >= 0 && diagramGraph != null && diagramGraph.indexByTransform.TryGetValue(piece, out int ip))
+            {
+                int shown = 0;
+                var detNow = latestDetections[detIdx];
+                Vector2 centerDet2D = ProjectTo2DCornerPlane(detNow.worldPosition);
+                foreach (var e in diagramGraph.nodes[ip].edges)
+                {
+                    var np = diagramGraph.nodes[e.toIndex].piece;
+                    // find a lastMatchResult for this neighbor to get its det position
+                    bool have = false;
+                    Vector2 neigh2D = Vector2.zero;
+                    for (int j = 0; j < lastMatchResults.Count; j++)
+                    {
+                        var r = lastMatchResults[j];
+                        if (r.matchedPieceTransform == np)
+                        {
+                            have = true;
+                            neigh2D = ProjectTo2DCornerPlane(r.detectionWorldPosition);
+                            break;
+                        }
+                    }
+                    if (!have) continue;
+
+                    Vector2 exp2D = ProjectTo2DCornerPlane(GetPieceCenterWorld(np));
+                    float dExp = Vector2.Distance(pieceCenter2D, exp2D);
+                    float dAct = Vector2.Distance(centerDet2D, neigh2D);
+                    float dDelta = Mathf.Abs(dAct - dExp);
+                    parts.Add("vs '" + np.name + "': d=" + dAct.ToString("F3") + "m exp=" + dExp.ToString("F3") + "m Delta=" + dDelta.ToString("F3") + " (tol<= " + _dynamicGraphDistanceTolerance.ToString("F3") + "m)");
+                    shown++; if (shown >= 2) break;
+                }
+            }
+
+            if (parts.Count == 0)
+            {
+                // absolute planar from piece center to last detection center if available
+                if (lastPlanar >= 0f) return "no-neighbor-info | lastDetPlanarFromPiece=" + lastPlanar.ToString("F3") + "m";
+                return "no-neighbor-info";
+            }
+            return string.Join(" | ", parts);
+        }
+        catch (Exception ex)
+        {
+            return "detail-error: " + ex.Message;
+        }
+    }
             }
 
             var parts = new System.Collections.Generic.List<string>();
@@ -5461,11 +5536,15 @@ AUGMENT:
     {
         try
         {
-            if (verboseRelationalFailureLogs)
-            {
-                var extra = BuildFailureDetails2(ls.piece, ls.type);
-                if (!string.IsNullOrEmpty(extra)) reason = reason + " | " + extra;
-            }
+            var extra = BuildFailureDetails2(ls.piece, ls.type);
+            if (!string.IsNullOrEmpty(extra)) reason = reason + " | " + extra;
+            Debug.LogWarning("[TangramMatcher] MATCH FAILED for locked piece '" + ls.piece.name + "'. Cause: " + reason);
+        }
+        catch (Exception ex)
+        {
+            Debug.LogWarning("[TangramMatcher] MATCH FAILED (logging error): " + ex.Message);
+        }
+    }
             Debug.LogWarning("[TangramMatcher] MATCH FAILED for locked piece '" + ls.piece.name + "'. Cause: " + reason);
 }
         catch (Exception ex)
