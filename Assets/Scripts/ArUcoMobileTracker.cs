@@ -63,9 +63,6 @@ public class ArUcoMobileTracker : MonoBehaviour
     // 예시용 기본 카메라 행렬 및 왜곡 계수
     private Mat camMatrix;
     private MatOfDouble distCoeffs;
-    [Header("Tangram / Diagram flip")]
-    [Tooltip("전면 카메라(useFrontCamera=true)일 때 도안을 자동 상하 반전합니다.")]
-    public bool autoFlipDiagramForFrontCamera = true;
 
     // -------- Stability buffer (10-frame time shifting) --------
     private struct BufferedSample
@@ -221,10 +218,6 @@ public class ArUcoMobileTracker : MonoBehaviour
         lastUseFrontCamera = useFrontCamera;
         lastSwitchCameraInRuntime = switchCameraInRuntime;
         StartWebCam();
-
-        // Sync diagram vertical mirror with current camera selection
-        if (tangramMatcher != null && autoFlipDiagramForFrontCamera)
-            tangramMatcher.SetDiagramVerticalMirror(useFrontCamera);
     }
 
     void RequestCameraPermission()
@@ -300,10 +293,6 @@ public class ArUcoMobileTracker : MonoBehaviour
             
             Debug.Log($"Camera change detected: Using front camera = {useFrontCamera}");
             SwitchCamera();
-
-            // Update diagram flip setting when camera changes
-            if (tangramMatcher != null && autoFlipDiagramForFrontCamera)
-                tangramMatcher.SetDiagramVerticalMirror(useFrontCamera);
         }
         
         if (webcamTexture == null || !webcamTexture.isPlaying || !webcamTexture.didUpdateThisFrame)

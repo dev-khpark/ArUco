@@ -201,23 +201,6 @@ public class TangramMatcher : MonoBehaviour
     [Tooltip("When building the diagram graph, keep only the single nearest neighbor edge for each node.")]
     public bool diagramOnlyNearestNeighbor = true;
 
-    [Header("Camera / Mirroring")]
-    [Tooltip("전면 카메라 사용 시 도안을 상하 반전해서 그래프/예상 각도를 계산합니다.")]
-    public bool mirrorDiagramVertically = false;
-
-    /// <summary>
-    /// Helper to toggle vertical mirroring of the diagram from external controllers (e.g., ArUcoMobileTracker)
-    /// </summary>
-    public void SetDiagramVerticalMirror(bool on)
-    {
-        if (mirrorDiagramVertically != on)
-        {
-            mirrorDiagramVertically = on;
-            Debug.Log($"[TangramMatcher] Diagram vertical mirror = {mirrorDiagramVertically}");
-            RebuildDiagramCache();
-        }
-    }
-
     [Header("Relational Angle Constraints")]
     [Tooltip("Additionally require that pairwise angles between matched neighbors are preserved (relative to the center).")]
     public bool usePairwiseNeighborAngle = false;
@@ -1760,9 +1743,6 @@ public class TangramMatcher : MonoBehaviour
             if (axisU.sqrMagnitude < 1e-6f) axisU = Vector3.Cross(planeN, Vector3.right);
             axisU.Normalize();
             Vector3 axisV = Vector3.Cross(planeN, axisU);
-            // Apply vertical mirroring for diagram plane if enabled
-            if (mirrorDiagramVertically)
-                axisV = -axisV;
 
             // Cache convex hulls for all nodes
             var hullCache = new Dictionary<int, List<Vector2>>();
@@ -3122,10 +3102,6 @@ AUGMENT:
         Vector3 dirProj = Vector3.ProjectOnPlane(dir, planeNormal);
         if (dirProj.sqrMagnitude < 1e-6f) return 0f;
         dirProj.Normalize();
-
-        // Mirror the connection direction on the diagram plane vertically when enabled
-        if (mirrorDiagramVertically)
-            dirProj = MirrorInDiagramPlaneVertical(dirProj, planeNormal);
         // Compute angle relative to fixed X axis on the plane for stability
         Vector3 refForward = Vector3.ProjectOnPlane(Vector3.right, planeNormal).normalized;
         if (refForward.sqrMagnitude < 1e-6f) refForward = Vector3.right;
@@ -3731,9 +3707,6 @@ AUGMENT:
         // Compute piece direction from 'center' -> 'direction' child if present; fallback to piece forward
         Vector3 pieceDir = GetPieceDirectionVector(piece);
         Vector3 pieceProj = Vector3.ProjectOnPlane(pieceDir, planeNormal).normalized;
-        // Mirror only the diagram piece direction when vertical mirror is enabled
-        if (mirrorDiagramVertically)
-            pieceProj = MirrorInDiagramPlaneVertical(pieceProj, planeNormal);
 
         if (detProj.sqrMagnitude < 1e-6f || pieceProj.sqrMagnitude < 1e-6f)
             return 0f;
@@ -3784,20 +3757,6 @@ AUGMENT:
         return piece.forward;
     }
 
-    /// <summary>
-    /// Reflects a vector across the diagram plane's vertical axis (axisV) defined by planeNormal.
-    /// </summary>
-    private Vector3 MirrorInDiagramPlaneVertical(Vector3 vec, Vector3 planeNormal)
-    {
-        Vector3 axisU = Vector3.Cross(planeNormal, Vector3.up);
-        if (axisU.sqrMagnitude < 1e-6f) axisU = Vector3.Cross(planeNormal, Vector3.right);
-        axisU.Normalize();
-        Vector3 axisV = Vector3.Cross(planeNormal, axisU);
-        float u = Vector3.Dot(vec, axisU);
-        float v = Vector3.Dot(vec, axisV);
-        return u * axisU + (-v) * axisV;
-    }
-
     private static float NormalizeAngle180(float deg)
     {
         while (deg > 180f) deg -= 360f;
@@ -3823,9 +3782,6 @@ AUGMENT:
         
         if (dirProj.sqrMagnitude < 1e-6f) return 0f;
         
-        if (mirrorDiagramVertically)
-            dirProj = MirrorInDiagramPlaneVertical(dirProj, planeNormal);
-
         // Calculate connection line angle using basic atan2 approach
         // In Unity, Z acts as Y in 2D coordinate system
         float angleRad = Mathf.Atan2(dirProj.z, dirProj.x);
@@ -3847,8 +3803,6 @@ AUGMENT:
     {
         float deltaX = toCoord.x - fromCoord.x;
         float deltaY = toCoord.y - fromCoord.y;
-        if (mirrorDiagramVertically)
-            deltaY = -deltaY;
         
         if (Mathf.Abs(deltaX) < 1e-6f && Mathf.Abs(deltaY) < 1e-6f) return 0f;
         
