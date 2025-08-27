@@ -118,6 +118,16 @@ public class TangramMatcher : MonoBehaviour
     [Tooltip("Log the built TangramDiagram graph (nodes and edges) when it is rebuilt.")]
     public bool debugLogDiagramGraph = true;
 
+    [Header("Relative Angle Debugging")]
+    [Tooltip("Enable detailed debugging logs for relative angle calculations.")]
+    public bool debugLogRelativeAngles = true;
+    [Tooltip("Log relative angle calculation process during diagram graph construction.")]
+    public bool debugLogDiagramGraphAngles = true;
+    [Tooltip("Log relative angle calculation process between detected shapes.")]
+    public bool debugLogDetectionAngles = true;
+    [Tooltip("Log angle comparison results between diagram and detected shapes.")]
+    public bool debugLogAngleComparison = true;
+
     [Header("Debug Colors")]
     public Color matchedColor = Color.green;
     public Color unmatchedColor = new Color(1f, 1f, 1f, 1f); // keep original white by default
@@ -690,6 +700,8 @@ public class TangramMatcher : MonoBehaviour
 
     void Awake()
     {
+       
+
         if (tangramDiagramRoot == null)
         {
             tangramDiagramRoot = transform;
@@ -722,6 +734,7 @@ public class TangramMatcher : MonoBehaviour
         for (int i = 0; i < tangramDiagramRoot.childCount; i++)
         {
             Transform child = tangramDiagramRoot.GetChild(i);
+            
             if (child == null)
                 continue;
 
@@ -1260,6 +1273,12 @@ public class TangramMatcher : MonoBehaviour
     {
         lastMatchResults.Clear();
 
+        // 상대 각도 디버깅: 감지된 도형들의 관계 요약 출력
+        if (debugLogRelativeAngles)
+        {
+            DebugLogDetectionRelationsSummary();
+        }
+
         // Build available piece lists per type
         var availablePieces = new Dictionary<TangramShapeType, List<Transform>>();
         foreach (var kv in diagramPiecesByType)
@@ -1453,7 +1472,31 @@ public class TangramMatcher : MonoBehaviour
         foreach (var result in lastMatchResults)
         {
             string graphInfo = BuildGraphDebugInfo(result);
-            Debug.Log($"[TangramMatcher] Matched {result.shapeType} (ArUco {result.arucoId}) -> Piece '{result.matchedPieceTransform.name}', distance = {result.worldDistanceMeters:F3} m, angle = {result.angleErrorDegrees:F1} deg. {graphInfo}");
+            
+            // 상대 각도 정보 추가
+            string relativeAngleInfo = "";
+            if (debugLogRelativeAngles)
+            {
+                var detection = FindDetection(result.shapeType, result.arucoId);
+                if (detection.HasValue)
+                {
+                    // 이 감지된 도형의 회전을 기준으로 한 방향 벡터
+                    Vector3 detectionOrientation = detection.Value.worldRotation * Vector3.right;
+                    Vector3 pieceOrientation = result.matchedPieceTransform.rotation * Vector3.right;
+                    Vector3 planeN = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
+                    
+                    Vector3 detOrientProj = Vector3.ProjectOnPlane(detectionOrientation, planeN).normalized;
+                    Vector3 pieceOrientProj = Vector3.ProjectOnPlane(pieceOrientation, planeN).normalized;
+                    
+                    if (detOrientProj.sqrMagnitude > 1e-6f && pieceOrientProj.sqrMagnitude > 1e-6f)
+                    {
+                        float orientationDiff = Vector3.SignedAngle(pieceOrientProj, detOrientProj, planeN);
+                        relativeAngleInfo = $" | 방향차이={NormalizeAngle180(orientationDiff):F1}°";
+                    }
+                }
+            }
+            
+            Debug.Log($"[TangramMatcher] Matched {result.shapeType} (ArUco {result.arucoId}) -> Piece '{result.matchedPieceTransform.name}', distance = {result.worldDistanceMeters:F3} m, angle = {result.angleErrorDegrees:F1} deg{relativeAngleInfo}. {graphInfo}");
             if (debugLogOrientationPerDetection && useAbsoluteOrientation)
             {
                 // Report absolute orientation difference (independent of relations) for this detection vs its assigned piece
@@ -1797,12 +1840,38 @@ public class TangramMatcher : MonoBehaviour
                 if (connect)
                 {
                     float centerDist = Vector3.Distance(pi, pj);
-                    // Enforce low-ID -> high-ID direction for expected angle
+                    // ★ 변경점: 새로운 상대 각도 계산 방식을 사용합니다.
+                    // ArUco ID를 기준으로 기준(from)과 목표(to) 조각을 일관되게 결정합니다.
                     int id_i = GetArucoIdForDiagramPiece(ni.piece);
                     int id_j = GetArucoIdForDiagramPiece(nj.piece);
-                    Vector3 fromPos = (id_i >= 0 && id_j >= 0 && id_i > id_j) ? pj : pi;
-                    Vector3 toPos   = (id_i >= 0 && id_j >= 0 && id_i > id_j) ? pi : pj;
-                    float angle = ComputePlanarAngleDeg(fromPos, toPos);
+                    Transform fromPiece, toPiece;
+                    if (id_i >= 0 && id_j >= 0 && id_i > id_j)
+                    {
+                        fromPiece = nj.piece;
+                        toPiece = ni.piece;
+                    }
+                    else
+                    {
+                        fromPiece = ni.piece;
+                        toPiece = nj.piece;
+                    }
+
+                    // 디버깅 컨텍스트 생성
+                    string debugContext = debugLogDiagramGraphAngles ? 
+                        $"DIAGRAM {fromPiece.name}(ID:{id_i}) → {toPiece.name}(ID:{id_j})" : "";
+
+                    // ★ 변경점: 다이어그램 전용 상대 각도 계산 함수('center'->'direction' 기반)를 호출합니다.
+                    float angle = ComputeRelativeAngleDegForDiagram(fromPiece,
+                        toPiece,
+                        debugContext);
+
+                    // 기존 방식과의 비교를 위한 로그 (선택적)
+                    if (debugLogDiagramGraphAngles)
+                    {
+                        float legacyAngle = ComputePlanarAngleDeg(GetPieceCenterWorld(fromPiece), GetPieceCenterWorld(toPiece));
+                        Debug.Log($"[DiagramGraph] {fromPiece.name} → {toPiece.name}: " +
+                                 $"새로운방식={angle:F2}°, 기존방식={legacyAngle:F2}°, 차이={Mathf.Abs(angle - legacyAngle):F2}°");
+                    }
                     var edge = new DiagramGraph.Edge
                     {
                         toIndex = diagramGraph.indexByTransform[nj.piece],
@@ -1858,14 +1927,15 @@ public class TangramMatcher : MonoBehaviour
     }
 
     /// <summary>
-    /// Returns a predefined ArUco ID for a diagram piece Transform based on its name.
-    /// This mapping must reflect the project's naming scheme.
+    /// Gets the ArUco ID associated with a diagram piece by looking up its shape type and position.
+    /// This is used to determine the consistent direction for relative angle calculations.
     /// </summary>
     private int GetArucoIdForDiagramPiece(Transform piece)
     {
         if (piece == null) return -1;
+
+        // First try name-based mapping for backward compatibility
         string n = piece.name != null ? piece.name.ToLower() : "";
-        // Example mapping: adjust as needed for your naming scheme
         if (n.Contains("triangle_l"))
         {
             return n.EndsWith("_2") ? 1 : 0; // LargeTriangle IDs: 0,1
@@ -1884,10 +1954,43 @@ public class TangramMatcher : MonoBehaviour
         }
         if (n.Contains("parallel") || n.Contains("parallelogram"))
         {
-            // Parallelogram IDs could be 6,7 depending on variant; extend if needed
-            return 6;
+            return n.EndsWith("_2") ? 7 : 6; // Parallelogram IDs: 6,7
         }
-        return -1; // unknown
+
+        // Fallback: Find the shape type of this piece and determine ID by order
+        TangramShapeType shapeType = TangramShapeType.LargeTriangle;
+        bool found = false;
+        foreach (var kv in diagramPiecesByType)
+        {
+            if (kv.Value.Contains(piece))
+            {
+                shapeType = kv.Key;
+                found = true;
+                break;
+            }
+        }
+        if (!found) return -1;
+
+        // Map shape type to ArUco ID ranges and determine which ID based on piece order
+        List<Transform> piecesOfType = diagramPiecesByType[shapeType];
+        int indexInType = piecesOfType.IndexOf(piece);
+        if (indexInType < 0) return -1;
+
+        switch (shapeType)
+        {
+            case TangramShapeType.LargeTriangle:
+                return indexInType == 0 ? 0 : 1; // IDs 0, 1
+            case TangramShapeType.MediumTriangle:
+                return 2; // ID 2
+            case TangramShapeType.SmallTriangle:
+                return indexInType == 0 ? 3 : 4; // IDs 3, 4
+            case TangramShapeType.Square:
+                return 5; // ID 5
+            case TangramShapeType.Parallelogram:
+                return indexInType == 0 ? 6 : 7; // IDs 6, 7
+            default:
+                return -1;
+        }
     }
 
     // ---------- Matching helpers ----------
@@ -3113,6 +3216,122 @@ AUGMENT:
         return ang;
     }
 
+    /// <summary>
+    /// [새로 추가] 다이어그램 조각 전용 상대 각도 계산 함수.
+    /// 기준 조각(fromPiece)의 'center' -> 'direction' 벡터를 0도 기준선으로 사용합니다.
+    /// </summary>
+    /// <param name="fromPiece">기준 조각의 Transform</param>
+    /// <param name="toPiece">목표 조각의 Transform</param>
+    /// <param name="debugContext">디버깅용 컨텍스트 정보</param>
+    /// <returns>상대 각도 (degrees, -180 ~ 180)</returns>
+    private float ComputeRelativeAngleDegForDiagram(Transform fromPiece, Transform toPiece, string debugContext = "")
+    {
+        // 계산의 기준이 될 평면의 법선 벡터를 정의합니다.
+        Vector3 planeNormal = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
+
+        // 1. 기준 조각의 방향 벡터('center'->'direction')를 구합니다. 이것이 새로운 '0도' 기준선입니다.
+        Vector3 fromOrientationVec = GetPieceDirectionVector(fromPiece);
+        Vector3 fromOrientationProj = Vector3.ProjectOnPlane(fromOrientationVec, planeNormal).normalized;
+        if (fromOrientationProj.sqrMagnitude < 1e-6f)
+        {
+            if (debugLogRelativeAngles && !string.IsNullOrEmpty(debugContext))
+            {
+                Debug.LogWarning($"[RelativeAngleDiagram] {debugContext}: 기준 방향 벡터를 계산할 수 없음 - 0도 반환");
+            }
+            return 0f;
+        }
+
+        // 2. 기준 조각에서 목표 조각으로 향하는 연결 벡터를 구합니다.
+        Vector3 fromPos = GetPieceCenterWorld(fromPiece);
+        Vector3 toPos = GetPieceCenterWorld(toPiece);
+        Vector3 connectionVec = toPos - fromPos;
+        Vector3 connectionVecProj = Vector3.ProjectOnPlane(connectionVec, planeNormal);
+        if (connectionVecProj.sqrMagnitude < 1e-6f)
+        {
+            if (debugLogRelativeAngles && !string.IsNullOrEmpty(debugContext))
+            {
+                Debug.LogWarning($"[RelativeAngleDiagram] {debugContext}: 연결 벡터가 너무 짧음 - 0도 반환");
+            }
+            return 0f;
+        }
+        connectionVecProj.Normalize();
+
+        // 3. 기준 방향 벡터로부터 연결 벡터까지의 부호 있는 각도를 계산합니다.
+        float relativeAngle = Vector3.SignedAngle(fromOrientationProj, connectionVecProj, planeNormal);
+        return NormalizeAngle180(relativeAngle);
+    }
+
+    /// <summary>
+    /// Computes relative angle between two pieces using planar projection.
+    /// This method projects both positions onto the diagram plane and calculates
+    /// the angle relative to the reference piece's local coordinate system.
+    /// </summary>
+    /// <param name="fromPos">World position of the reference piece</param>
+    /// <param name="fromRotation">World rotation of the reference piece</param>
+    /// <param name="toPos">World position of the target piece</param>
+    /// <param name="debugContext">Optional debug context for logging</param>
+    /// <returns>Relative angle in degrees</returns>
+    private float ComputeRelativeAngleDeg(Vector3 fromPos, Quaternion fromRotation, Vector3 toPos, string debugContext = "")
+    {
+        // Define the diagram plane
+        Vector3 planeNormal = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
+        Vector3 planeOrigin = tangramDiagramRoot != null ? tangramDiagramRoot.position : Vector3.zero;
+
+        // Project both positions onto the diagram plane
+        Vector3 fromPosProjected = fromPos - Vector3.Dot(fromPos - planeOrigin, planeNormal) * planeNormal;
+        Vector3 toPosProjected = toPos - Vector3.Dot(toPos - planeOrigin, planeNormal) * planeNormal;
+
+        // Calculate direction vector in the plane
+        Vector3 directionInPlane = toPosProjected - fromPosProjected;
+        
+        if (directionInPlane.sqrMagnitude < 1e-6f)
+        {
+            if (debugLogRelativeAngles && !string.IsNullOrEmpty(debugContext))
+            {
+                Debug.Log($"[RelativeAngle] {debugContext}: Zero distance, returning 0°");
+            }
+            return 0f;
+        }
+
+        directionInPlane.Normalize();
+
+        // Get the reference piece's local +X direction projected onto the plane
+        Vector3 referenceDirection = fromRotation * Vector3.right;
+        Vector3 referenceDirProjected = Vector3.ProjectOnPlane(referenceDirection, planeNormal);
+        
+        if (referenceDirProjected.sqrMagnitude < 1e-6f)
+        {
+            // Fallback to world right if reference direction is parallel to plane normal
+            referenceDirProjected = Vector3.ProjectOnPlane(Vector3.right, planeNormal);
+        }
+        
+        referenceDirProjected.Normalize();
+
+        // Calculate the relative angle
+        float relativeAngle = Vector3.SignedAngle(referenceDirProjected, directionInPlane, planeNormal);
+        relativeAngle = NormalizeAngle180(relativeAngle);
+
+        // Apply connection-angle offset if enabled
+        if (applyOffsetToConnectionAngles)
+            relativeAngle = NormalizeAngle180(relativeAngle + angleOffset);
+
+        // Debug logging
+        if (debugLogRelativeAngles && !string.IsNullOrEmpty(debugContext))
+        {
+            Vector3 fromEuler = fromRotation.eulerAngles;
+            Debug.Log($"[RelativeAngle] {debugContext}:");
+            Debug.Log($"  From: ({fromPos.x:F3}, {fromPos.y:F3}, {fromPos.z:F3}) rot=({fromEuler.x:F1}°, {fromEuler.y:F1}°, {fromEuler.z:F1}°)");
+            Debug.Log($"  To: ({toPos.x:F3}, {toPos.y:F3}, {toPos.z:F3})");
+            Debug.Log($"  Projected From: ({fromPosProjected.x:F3}, {fromPosProjected.y:F3}, {fromPosProjected.z:F3})");
+            Debug.Log($"  Projected To: ({toPosProjected.x:F3}, {toPosProjected.y:F3}, {toPosProjected.z:F3})");
+            Debug.Log($"  Direction in plane: ({directionInPlane.x:F3}, {directionInPlane.y:F3}, {directionInPlane.z:F3})");
+            Debug.Log($"  Reference direction: ({referenceDirProjected.x:F3}, {referenceDirProjected.y:F3}, {referenceDirProjected.z:F3})");
+            Debug.Log($"  Relative angle: {relativeAngle:F2}° (offset applied: {applyOffsetToConnectionAngles})");
+        }
+
+        return relativeAngle;
+    }
+
     private Vector3 GetPieceCenterWorld(Transform piece)
     {
         if (piece == null) return Vector3.zero;
@@ -3196,6 +3415,71 @@ AUGMENT:
         if (applyOffsetToConnectionAngles)
             ang = NormalizeAngle180(ang + angleOffset);
         return ang;
+    }
+
+    /// <summary>
+    /// Computes connection line angle between two 2D coordinates on the diagram plane.
+    /// This is used for calculating expected angles in diagram graph construction.
+    /// </summary>
+    /// <param name="fromCoord">2D coordinate of the starting point</param>
+    /// <param name="toCoord">2D coordinate of the ending point</param>
+    /// <returns>Connection angle in degrees</returns>
+    private float ComputeConnectionLineAngleFromCoords(Vector2 fromCoord, Vector2 toCoord)
+    {
+        Vector2 direction = toCoord - fromCoord;
+        if (direction.sqrMagnitude < 1e-6f) return 0f;
+        
+        // Calculate angle relative to positive X axis (right direction)
+        float angle = Mathf.Atan2(direction.y, direction.x) * Mathf.Rad2Deg;
+        angle = NormalizeAngle180(angle);
+        
+        // Apply connection-angle offset if enabled
+        if (applyOffsetToConnectionAngles)
+            angle = NormalizeAngle180(angle + angleOffset);
+            
+        return angle;
+    }
+
+    /// <summary>
+    /// Computes connection line angle between two 3D world positions.
+    /// This is a fallback method when 2D coordinates are not available.
+    /// </summary>
+    /// <param name="fromPos">3D world position of the starting point</param>
+    /// <param name="toPos">3D world position of the ending point</param>
+    /// <returns>Connection angle in degrees</returns>
+    private float ComputeConnectionLineAngle(Vector3 fromPos, Vector3 toPos)
+    {
+        // This is essentially the same as ComputePlanarAngleDeg but with a different name for clarity
+        return ComputePlanarAngleDeg(fromPos, toPos);
+    }
+
+    /// <summary>
+    /// Projects a 3D world position onto the 2D diagram plane coordinate system.
+    /// This ensures consistent 2D coordinate calculations for distance and angle measurements.
+    /// </summary>
+    /// <param name="worldPos">3D world position to project</param>
+    /// <returns>2D coordinate on the diagram plane</returns>
+    private Vector2 ProjectTo2DCornerPlane(Vector3 worldPos)
+    {
+        // Define the diagram plane
+        Vector3 planeNormal = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
+        Vector3 planeOrigin = tangramDiagramRoot != null ? tangramDiagramRoot.position : Vector3.zero;
+
+        // Create orthonormal basis for the plane
+        Vector3 axisU = Vector3.Cross(planeNormal, Vector3.up);
+        if (axisU.sqrMagnitude < 1e-6f) axisU = Vector3.Cross(planeNormal, Vector3.right);
+        axisU.Normalize();
+        Vector3 axisV = Vector3.Cross(planeNormal, axisU).normalized;
+
+        // Project the world position onto the plane
+        Vector3 projectedPos = worldPos - Vector3.Dot(worldPos - planeOrigin, planeNormal) * planeNormal;
+        
+        // Convert to 2D coordinates using the plane basis
+        Vector3 relativePos = projectedPos - planeOrigin;
+        float x = Vector3.Dot(relativePos, axisU);
+        float y = Vector3.Dot(relativePos, axisV);
+
+        return new Vector2(x, y);
     }
 
     private float ComputeAveragePairwiseAngle(List<Vector3> dirs)
@@ -3331,21 +3615,101 @@ AUGMENT:
             Debug.Log("[TangramMatcher] Diagram graph is null");
             return;
         }
-        Debug.Log($"[TangramMatcher] Diagram graph: nodes={diagramGraph.nodes.Count}");
+        
+        Debug.Log($"[TangramMatcher] === Diagram Graph (상대 각도 기반) ===");
+        Debug.Log($"노드 수: {diagramGraph.nodes.Count}");
+        
         for (int i = 0; i < diagramGraph.nodes.Count; i++)
         {
             var n = diagramGraph.nodes[i];
             Vector3 centerPos = GetPieceCenterWorld(n.piece);
-            string edges = "";
+            int pieceId = GetArucoIdForDiagramPiece(n.piece);
+            Vector3 pieceEuler = n.piece.transform.rotation.eulerAngles;
+            
+            Debug.Log($"[{i}] {n.piece.name} (ArUco ID: {pieceId})");
+            Debug.Log($"    위치: ({centerPos.x:F3}, {centerPos.y:F3}, {centerPos.z:F3})");
+            Debug.Log($"    회전: ({pieceEuler.x:F1}°, {pieceEuler.y:F1}°, {pieceEuler.z:F1}°)");
+            Debug.Log($"    크기: {n.sizeMeters:F3}m");
+            Debug.Log($"    연결된 엣지 수: {n.edges.Count}");
+            
             for (int e = 0; e < n.edges.Count; e++)
             {
                 var ed = n.edges[e];
                 var to = diagramGraph.nodes[ed.toIndex].piece;
                 Vector3 toCenterPos = GetPieceCenterWorld(to);
-                edges += $" -> {to.name}(d={ed.expectedDistanceMeters:F2}m, θ={ed.expectedAngleDeg:F0}°, nd={ed.normalizedDistance:F2} of max, center=({toCenterPos.x:F4},{toCenterPos.y:F4},{toCenterPos.z:F4}))";
+                int toId = GetArucoIdForDiagramPiece(to);
+                
+                // 기존 방식과 비교를 위한 각도 계산
+                float legacyAngle = ComputePlanarAngleDeg(centerPos, toCenterPos);
+                float angleDiff = Mathf.Abs(NormalizeAngle180(ed.expectedAngleDeg - legacyAngle));
+                
+                Debug.Log($"    -> {to.name} (ArUco ID: {toId})");
+                Debug.Log($"       거리: {ed.expectedDistanceMeters:F3}m");
+                Debug.Log($"       상대각도: {ed.expectedAngleDeg:F2}° (기존방식: {legacyAngle:F2}°, 차이: {angleDiff:F2}°)");
+                Debug.Log($"       정규화거리: {ed.normalizedDistance:F3}");
+                Debug.Log($"       목표위치: ({toCenterPos.x:F3}, {toCenterPos.y:F3}, {toCenterPos.z:F3})");
             }
-            Debug.Log($"  [{i}] {n.piece.name} size~{n.sizeMeters:F2}m center=({centerPos.x:F4},{centerPos.y:F4},{centerPos.z:F4}){edges}");
+            
+            if (n.edges.Count == 0)
+            {
+                Debug.Log($"    (연결된 엣지 없음)");
+            }
         }
+        
+        Debug.Log($"=== Diagram Graph 완료 ===");
+    }
+
+    /// <summary>
+    /// 감지된 도형들 간의 상대 각도 관계를 요약해서 로그로 출력합니다.
+    /// </summary>
+    private void DebugLogDetectionRelationsSummary()
+    {
+        if (!debugLogRelativeAngles || latestDetections == null || latestDetections.Count < 2)
+            return;
+
+        Debug.Log($"[TangramMatcher] === 감지된 도형들의 상대 각도 관계 요약 ===");
+        Debug.Log($"감지된 도형 수: {latestDetections.Count}");
+
+        var nonCornerDetections = new List<DetectedShape>();
+        foreach (var det in latestDetections)
+        {
+            if (!det.isCorner) nonCornerDetections.Add(det);
+        }
+
+        Debug.Log($"비-코너 도형 수: {nonCornerDetections.Count}");
+
+        for (int i = 0; i < nonCornerDetections.Count; i++)
+        {
+            var detA = nonCornerDetections[i];
+            Vector3 eulerA = detA.worldRotation.eulerAngles;
+            
+            Debug.Log($"[{i}] {detA.shapeType}:{detA.arucoId}");
+            Debug.Log($"    위치: ({detA.worldPosition.x:F3}, {detA.worldPosition.y:F3}, {detA.worldPosition.z:F3})");
+            Debug.Log($"    회전: ({eulerA.x:F1}°, {eulerA.y:F1}°, {eulerA.z:F1}°)");
+            Debug.Log($"    평면좌표: ({detA.planeCoord.x:F3}, {detA.planeCoord.y:F3})");
+            Debug.Log($"    평면각도: {detA.planeAngleDeg:F2}°");
+
+            // 다른 도형들과의 관계
+            for (int j = i + 1; j < nonCornerDetections.Count; j++)
+            {
+                var detB = nonCornerDetections[j];
+                var fromDet = (detA.arucoId <= detB.arucoId) ? detA : detB;
+                var toDet = (detA.arucoId <= detB.arucoId) ? detB : detA;
+
+                float relativeAngle = ComputeRelativeAngleDeg(
+                    fromDet.worldPosition,
+                    fromDet.worldRotation,
+                    toDet.worldPosition,
+                    $"SUMMARY {fromDet.shapeType}:{fromDet.arucoId} → {toDet.shapeType}:{toDet.arucoId}"
+                );
+
+                float distance = Vector3.Distance(detA.worldPosition, detB.worldPosition);
+                
+                Debug.Log($"    -> {detB.shapeType}:{detB.arucoId}: 거리={distance:F3}m, 상대각도={relativeAngle:F2}°");
+            }
+        }
+
+        Debug.Log($"=== 감지된 도형 관계 요약 완료 ===");
     }
 
     private void ComputeAndStoreErrorStats()
@@ -3765,54 +4129,7 @@ AUGMENT:
     }
 
     /// <summary>
-    /// Computes the angle that the connection line between two 3D world points makes with the X axis (basic atan2 approach).
-    /// The points are projected onto the plane and the angle is calculated using atan2.
-    /// </summary>
-    /// <param name="from">Starting point in 3D world coordinates</param>
-    /// <param name="to">Ending point in 3D world coordinates</param>
-    /// <returns>Connection line angle in degrees, normalized to [-180, 180] range</returns>
-    private float ComputeConnectionLineAngle(Vector3 from, Vector3 to)
-    {
-        Vector3 dir = to - from;
-        
-        // Project onto the plane (same as existing code)
-        Vector3 planeNormal = useXYPlane ? Vector3.forward : 
-            (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
-        Vector3 dirProj = Vector3.ProjectOnPlane(dir, planeNormal);
-        
-        if (dirProj.sqrMagnitude < 1e-6f) return 0f;
-        
-        // Calculate connection line angle using basic atan2 approach
-        // In Unity, Z acts as Y in 2D coordinate system
-        float angleRad = Mathf.Atan2(dirProj.z, dirProj.x);
-        float angleDeg = angleRad * Mathf.Rad2Deg;
-        angleDeg = NormalizeAngle180(angleDeg);
-        if (applyOffsetToConnectionAngles)
-            angleDeg = NormalizeAngle180(angleDeg + angleOffset);
-        return angleDeg;
-    }
 
-    /// <summary>
-    /// Computes the angle that the connection line between two 2D plane coordinates makes with the X axis.
-    /// Uses basic atan2 calculation for clear and direct connection line angle.
-    /// </summary>
-    /// <param name="fromCoord">Starting point in 2D plane coordinates</param>
-    /// <param name="toCoord">Ending point in 2D plane coordinates</param>
-    /// <returns>Connection line angle in degrees, normalized to [-180, 180] range</returns>
-    private float ComputeConnectionLineAngleFromCoords(Vector2 fromCoord, Vector2 toCoord)
-    {
-        float deltaX = toCoord.x - fromCoord.x;
-        float deltaY = toCoord.y - fromCoord.y;
-        
-        if (Mathf.Abs(deltaX) < 1e-6f && Mathf.Abs(deltaY) < 1e-6f) return 0f;
-        
-        float angleRad = Mathf.Atan2(deltaY, deltaX);
-        float angleDeg = angleRad * Mathf.Rad2Deg;
-        angleDeg = NormalizeAngle180(angleDeg);
-        if (applyOffsetToConnectionAngles)
-            angleDeg = NormalizeAngle180(angleDeg + angleOffset);
-        return angleDeg;
-    }
 
     /// <summary>
     /// Computes a consistent relation angle between two detections using the 'low ArUco ID -> high ArUco ID' rule.
@@ -4113,28 +4430,7 @@ AUGMENT:
         return currentCornerPlane.isValid;
     }
 
-    /// <summary>
-    /// Projects a 3D world position onto the corner-defined 2D plane coordinate system.
-    /// </summary>
-    /// <param name="worldPos">3D world position to project</param>
-    /// <returns>2D coordinates in the corner plane system</returns>
-    private Vector2 ProjectTo2DCornerPlane(Vector3 worldPos)
-    {
-        if (!currentCornerPlane.isValid)
-        {
-            // Fallback to simple projection if corner plane is not available
-            return new Vector2(worldPos.x, worldPos.z);
-        }
-        
-        // Project point onto the plane
-        Vector3 relativePos = worldPos - currentCornerPlane.origin;
-        
-        // Calculate 2D coordinates using the orthonormal basis
-        float u = Vector3.Dot(relativePos, currentCornerPlane.uAxis);
-        float v = Vector3.Dot(relativePos, currentCornerPlane.vAxis);
-        
-        return new Vector2(u, v);
-    }
+
 
     /// <summary>
     /// Debug function that logs all connection angles between detected shapes for comprehensive debugging.
@@ -4157,7 +4453,19 @@ AUGMENT:
                 var A = latestDetections[i];
                 var B = latestDetections[j];
                 
-                float connectionAngle = ComputeConsistentRelationAngle(A, B);
+                // ★ 변경점: 새로운 상대 각도 계산 방식을 사용합니다.
+                var fromShape = (A.arucoId <= B.arucoId) ? A : B;
+                var toShape   = (A.arucoId <= B.arucoId) ? B : A;
+                
+                string allConnectionsDebugContext = debugLogRelativeAngles ? 
+                    $"ALL_CONNECTIONS {fromShape.shapeType}:{fromShape.arucoId} → {toShape.shapeType}:{toShape.arucoId}" : "";
+                
+                float connectionAngle = ComputeRelativeAngleDeg(
+                    fromShape.worldPosition,
+                    fromShape.worldRotation,
+                    toShape.worldPosition,
+                    allConnectionsDebugContext
+                );
                 float distance = Vector2.Distance(A.planeCoord, B.planeCoord);
                 
                 Debug.Log($"[TangramMatcher] CONNECTION det({A.shapeType}:{A.arucoId}) -> det({B.shapeType}:{B.arucoId}) | " +
@@ -4548,8 +4856,21 @@ AUGMENT:
             // Use 2D distance on corner-projected plane
             float dActual = Vector2.Distance(A.planeCoord, B.planeCoord);
             
-            // Calculate actual connection angle using new method
-            float actualConnectionAngle = ComputeConsistentRelationAngle(A, B);
+            // ArUco ID를 기준으로 기준(from)과 목표(to) 도형을 일관되게 결정합니다.
+            var fromDet = (A.arucoId <= B.arucoId) ? A : B;
+            var toDet   = (A.arucoId <= B.arucoId) ? B : A;
+                        
+            // 디버깅 컨텍스트 생성
+            string detectionDebugContext = debugLogDetectionAngles ? 
+                $"DETECTION {fromDet.shapeType}(ID:{fromDet.arucoId}) → {toDet.shapeType}(ID:{toDet.arucoId})" : "";
+
+            // ★ 변경점: 감지된 도형들의 '실제' 관계 각도를 새로운 상대 각도 방식으로 계산합니다.
+            float actualConnectionAngle = ComputeRelativeAngleDeg(
+                fromDet.worldPosition,
+                fromDet.worldRotation,
+                toDet.worldPosition,
+                detectionDebugContext
+            );
             Transform pA = FindAssignedPieceFor(A.shapeType, A.arucoId);
             Transform pB = FindAssignedPieceFor(B.shapeType, B.arucoId);
             if (pA != null && pB != null)
@@ -4576,11 +4897,33 @@ AUGMENT:
                 Vector2 pACoord = ProjectTo2DCornerPlane(GetPieceCenterWorld(pA));
                 Vector2 pBCoord = ProjectTo2DCornerPlane(GetPieceCenterWorld(pB));
                 float dExp = Vector2.Distance(pACoord, pBCoord);
-                // Calculate expected connection angle using 2D projected coordinates
-                // Enforce low-ID -> high-ID for expected angle as well
-                float expectedConnectionAngle = (A.arucoId <= B.arucoId)
-                    ? ComputeConnectionLineAngleFromCoords(pACoord, pBCoord)
-                    : ComputeConnectionLineAngleFromCoords(pBCoord, pACoord);
+                
+                // 감지된 도형과 매칭되는 정답 조각들을 가져옵니다.
+                var fromPiece = (A.arucoId <= B.arucoId) ? pA : pB;
+                var toPiece   = (A.arucoId <= B.arucoId) ? pB : pA;
+                
+                // 디버깅 컨텍스트 생성
+                string diagramDebugContext = debugLogDetectionAngles ? 
+                    $"EXPECTED {fromPiece.name} → {toPiece.name}" : "";
+
+                // ★ 변경점: 정답 조각들의 '기대' 관계 각도를 새로운 상대 각도 방식으로 계산합니다.
+                float expectedConnectionAngle = ComputeRelativeAngleDeg(
+                    GetPieceCenterWorld(fromPiece),
+                    fromPiece.transform.rotation,
+                    GetPieceCenterWorld(toPiece),
+                    diagramDebugContext
+                );
+
+                // 각도 비교 결과 로그
+                if (debugLogAngleComparison)
+                {
+                    float angleDifference = Mathf.Abs(NormalizeAngle180(actualConnectionAngle - expectedConnectionAngle));
+                    Debug.Log($"[AngleComparison] {fromDet.shapeType}:{fromDet.arucoId} → {toDet.shapeType}:{toDet.arucoId}\n" +
+                             $"  실제각도: {actualConnectionAngle:F2}° (감지된 도형들)\n" +
+                             $"  기대각도: {expectedConnectionAngle:F2}° (다이어그램 조각들)\n" +
+                             $"  각도차이: {angleDifference:F2}° (허용범위: {relationMaxAngleDiffDeg:F1}°)\n" +
+                             $"  결과: {(angleDifference <= relationMaxAngleDiffDeg ? "PASS" : "FAIL")}");
+                }
                 // Apply first-pass direction offset if available
                 if (useFirstPassDirectionOffset && firstPassDirOffsetValid)
                     expectedConnectionAngle = NormalizeAngle180(expectedConnectionAngle + firstPassDirOffsetDeg);
