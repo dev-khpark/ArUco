@@ -240,10 +240,19 @@ public class ArUcoMobileTracker : MonoBehaviour
             if (!string.IsNullOrEmpty(selectedCameraName))
             {
                 webcamTexture = new WebCamTexture(selectedCameraName, cameraWidth, cameraHeight);
+
+                
                 webcamTexture.Play();
 
                 rawImageDisplay.texture = webcamTexture;
                 rawImageDisplay.material.mainTexture = webcamTexture;
+                if (useFrontCamera){
+
+                    rawImageDisplay.rectTransform.localEulerAngles = new Vector3(0, 0, -webcamTexture.videoRotationAngle);
+                    rawImageDisplay.rectTransform.localScale = new Vector3(1, -1, 1);
+                }
+                
+
                 // Camera successfully started, print debug information in English
                 Debug.Log($"Camera started: {selectedCameraName} ({cameraWidth}x{cameraHeight})");
             }
@@ -303,8 +312,16 @@ public class ArUcoMobileTracker : MonoBehaviour
         {
             camMat = new Mat(webcamTexture.height, webcamTexture.width, CvType.CV_8UC3);
         }
+    
 
         Utils.webCamTextureToMat(webcamTexture, camMat);
+
+        //Flip camMat
+        if (useFrontCamera)
+        {
+            Core.flip(camMat, camMat, 1); // 1 = 좌우 반전
+        }
+     
 
         // ArUco 마커 감지
         arucoDetector.detectMarkers(camMat, corners, ids);
@@ -508,7 +525,13 @@ public class ArUcoMobileTracker : MonoBehaviour
         if (texture == null || texture.width != camMat.width() || texture.height != camMat.height())
         {
             texture = new Texture2D(camMat.width(), camMat.height(), TextureFormat.RGBA32, false);
+
+            
+
             rawImageDisplay.texture = texture;
+
+            
+
         }
 
         Utils.matToTexture2D(camMat, texture);

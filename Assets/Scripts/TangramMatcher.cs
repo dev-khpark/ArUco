@@ -2179,7 +2179,7 @@ public class TangramMatcher : MonoBehaviour
                                 }
                                 bool passDist = angleOnlyForTwoDetections ? true : (d <= _dynamicGraphDistanceTolerance);
                                 bool passAng = (a <= graphAngleToleranceDeg);
-                                bool passes = angleOnlyForTwoDetections ? (passAng || passOriGate) : (passDist && (passAng || passOriGate));
+                                bool passes = angleOnlyForTwoDetections ? (passAng && passOriGate) : (passDist && passAng && passOriGate);
                                 if (passes)
                                 {
                                     // Replace distance component with selected model
@@ -2286,9 +2286,9 @@ public class TangramMatcher : MonoBehaviour
                                         }
                                         cost += absoluteOrientationWeightMetersPerDeg * absOriDeg;
                                     }
-                                    // If relation angle or ORI passes, prefer nearest diagram piece by absolute planar distance
+                                    // If relation angle AND ORI passes, prefer nearest diagram piece by absolute planar distance
                                     bool anglePassLocal = (a <= graphAngleToleranceDeg);
-                                    if (anglePassLocal || oriPassLocal)
+                                    if (anglePassLocal && oriPassLocal)
                                     {
                                         var detx2 = latestDetections[node.detIndex];
                                         Vector3 planeN_abs2 = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
@@ -2436,7 +2436,7 @@ public class TangramMatcher : MonoBehaviour
                             bool passDist = d <= _dynamicGraphDistanceTolerance;
                             bool passAng = a <= graphAngleToleranceDeg;
                             bool passOri = !useAbsoluteOrientation || ComputeAngleError(node.type, latestDetections[node.detIndex].worldRotation, p) <= absoluteOrientationToleranceDeg;
-                            bool pass = angleOnlyForTwoDetections ? (passAng || passOri) : (passDist && (passAng || passOri));
+                            bool pass = angleOnlyForTwoDetections ? (passAng && passOri) : (passDist && passAng && passOri);
 
                             if (pass)
                             {
@@ -4937,8 +4937,8 @@ AUGMENT:
                 {
                     bool passConnectionAngle = connectionAngleDiff <= relationMaxAngleDiffDeg;
                     bool passOri = !useAbsoluteOrientation || (oriA <= absoluteOrientationToleranceDeg && oriB <= absoluteOrientationToleranceDeg);
-                    // Distance is always true, pass if either connection angle OR orientation passes
-                    bool pass = passConnectionAngle || passOri;
+                    // Distance is always true, pass if both connection angle AND orientation passes
+                    bool pass = passConnectionAngle && passOri;
                     if (useFirstPassRelativeScale && pass && !firstPassScaleValid)
                     {
                         TrySetFirstPassScale(dActual, dExp);
@@ -5000,8 +5000,8 @@ AUGMENT:
                         ? true
                         : (connectionAngleDiff <= relationMaxAngleDiffDeg);
                     bool passOri = !useAbsoluteOrientation || (oriA <= absoluteOrientationToleranceDeg && oriB <= absoluteOrientationToleranceDeg);
-                    // First relation: require ORI only until offset is locked; then use (Angle OR ORI)
-                    bool pass = passDist && (passConnectionAngle || passOri);
+                    // First relation: require dist AND angle AND ori to all pass
+                    bool pass = passDist && passConnectionAngle && passOri;
 
                     // Dynamic tolerance update on successful relation
                     if (pass)
@@ -5247,8 +5247,8 @@ AUGMENT:
                                     Vector3 rel = proj - po; b2dx = Vector3.Dot(rel, u); b2dy = Vector3.Dot(rel, vaxis);
                                 }
                             }
-                            // Pass if distance passes AND either connection angle OR orientation passes
-                            bool proxyPass = passDist && (passAng || passOri);
+                            // Pass if distance passes AND connection angle AND orientation passes
+                            bool proxyPass = passDist && passAng && passOri;
                             if (proxyPass)
                             {
                                 float newToleranceP = dAct * 1.25f;
@@ -5446,8 +5446,8 @@ AUGMENT:
                     float oriB = detB.HasValue ? ComputeAngleError(nb.Value.shapeType, detB.Value.worldRotation, neighPiece) : 0f;
                     passOri = (oriA <= absoluteOrientationToleranceDeg && oriB <= absoluteOrientationToleranceDeg);
                 }
-                // Pass if distance passes AND either connection angle OR orientation passes
-                bool pass = (angleOnlyForTwoDetections ? (passAng || passOri) : (passDist && (passAng || passOri)));
+                // Pass if distance passes AND connection angle AND orientation passes
+                bool pass = (angleOnlyForTwoDetections ? (passAng && passOri) : (passDist && passAng && passOri));
                 anyPass |= pass;
                 allPass &= pass;
             }
