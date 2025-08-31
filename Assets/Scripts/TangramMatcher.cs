@@ -1266,486 +1266,6 @@ public class TangramMatcher : MonoBehaviour
     }
 #endif
 
-    /// <summary>
-    /// Compute matches and apply debug coloring.
-    /// </summary>
-    private void RunMatchingAndHighlight()
-    {
-        lastMatchResults.Clear();
-
-        // 상대 각도 디버깅: 감지된 도형들의 관계 요약 출력
-        if (debugLogRelativeAngles)
-        {
-            DebugLogDetectionRelationsSummary();
-        }
-
-        // Build available piece lists per type
-        var availablePieces = new Dictionary<TangramShapeType, List<Transform>>();
-        foreach (var kv in diagramPiecesByType)
-        {
-            availablePieces[kv.Key] = new List<Transform>(kv.Value);
-        }
-
-        var matchedPieceSet = new HashSet<Transform>();
-
-        var linkSegments = new List<(Vector3 from, Vector3 to, float dist, Transform piece, TangramShapeType type, int id)>();
-        // Collect near-miss segments in a local list, pass by reference where needed
-        var nearMissSegments = new List<(Vector3 from, Vector3 to, float dist, Transform piece, TangramShapeType type, int id)>();
-
-        // Orientation-only PRE-ASSIGNMENT: if a shape type has exactly one detection but multiple diagram pieces
-        // of that type exist, assign it solely by absolute orientation BEFORE graph matching to avoid relation bias.
-        if (forceOrientationForSingleDetection && useAbsoluteOrientation)
-        {
-            var detectionsByTypePre = new Dictionary<TangramShapeType, List<int>>();
-            for (int i = 0; i < latestDetections.Count; i++)
-            {
-                var d = latestDetections[i];
-                if (d.isCorner) continue;
-                if (!detectionsByTypePre.TryGetValue(d.shapeType, out var list))
-                {
-                    list = new List<int>();
-                    detectionsByTypePre[d.shapeType] = list;
-                }
-                list.Add(i);
-            }
-            foreach (var kv in detectionsByTypePre)
-            {
-                var type = kv.Key;
-                var list = kv.Value;
-                if (list.Count != 1) continue;
-                if (!availablePieces.TryGetValue(type, out var candidates) || candidates == null) continue;
-                // Consider all currently available (unmatched/unlocked) pieces of this type
-                var remaining = new List<Transform>(candidates);
-                if (remaining.Count <= 1) continue;
-
-                int detIndex = list[0];
-                var det = latestDetections[detIndex];
-                float bestAng = float.PositiveInfinity;
-                Transform bestPiece = null;
-                foreach (var piece in remaining)
-                {
-                    if (piece == null) continue;
-                    float a = ComputeAngleError(type, det.worldRotation, piece);
-                    if (a < bestAng)
-                    {
-                        bestAng = a;
-                        bestPiece = piece;
-                    }
-                }
-                if (bestPiece != null)
-                {
-                    // Use preAssignedDetections so downstream matching treats it as fixed
-                    preAssignedDetections[detIndex] = bestPiece;
-                    if (debugLogOrientationDiff)
-                    {
-                        Debug.Log($"[TangramMatcher] ORI preassign (single det) {type}:{det.arucoId} -> diag({bestPiece.name}) | absOri={bestAng:F1}°");
-                    }
-                }
-            }
-        }
-
-        // Absolute greedy matching removed – use graph-only matching
-        RunGraphOnlyMatching(availablePieces, matchedPieceSet, linkSegments);
-
-        // Orientation-only assignment fallback:
-        // If a shape type has exactly 1 detection and multiple diagram pieces remain for that type,
-        // assign it to the piece with the smallest absolute orientation difference (ignoring relations),
-        // but only if the piece is not already matched in this frame.
-        if ((forceOrientationForSingleDetection ) && useAbsoluteOrientation)
-        {
-            var detectionsByType = new Dictionary<TangramShapeType, List<int>>();
-            for (int i = 0; i < latestDetections.Count; i++)
-            {
-                var d = latestDetections[i];
-                if (d.isCorner) continue;
-                if (!detectionsByType.TryGetValue(d.shapeType, out var list))
-                {
-                    list = new List<int>();
-                    detectionsByType[d.shapeType] = list;
-                }
-                list.Add(i);
-            }
-            foreach (var kv in detectionsByType)
-            {
-                var type = kv.Key;
-                var list = kv.Value;
-                if (list.Count != 1) continue;
-                // Collect remaining unmatched diagram pieces of this type
-                if (!diagramPiecesByType.TryGetValue(type, out var allPieces)) continue;
-                var remaining = new List<Transform>();
-                foreach (var p in allPieces) if (!matchedPieceSet.Contains(p)) remaining.Add(p);
-                if (remaining.Count <= 1) continue;
-
-                int detIndex = list[0];
-                var det = latestDetections[detIndex];
-                Vector3 planeN = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
-                Vector3 detDir = Vector3.ProjectOnPlane(det.worldRotation * Vector3.right, planeN).normalized;
-                if (detDir.sqrMagnitude < 1e-6f) continue;
-
-                float bestAng = float.PositiveInfinity;
-                Transform bestPiece = null;
-                if (debugLogOrientationSweep)
-                {
-                    Debug.Log($"[TangramMatcher] ORI sweep for det({type}:{det.arucoId}) vs {remaining.Count} candidates");
-                }
-                foreach (var piece in remaining)
-                {
-                    Vector3 pieceDir = Vector3.ProjectOnPlane(GetPieceDirectionVector(piece), planeN).normalized;
-                    if (pieceDir.sqrMagnitude < 1e-6f) continue;
-                    float a = Mathf.Abs(Vector3.SignedAngle(pieceDir, detDir, planeN));
-                    a = NormalizeAngle180(a);
-                    float mod = GetSymmetryModuloDegrees(type);
-                    if (mod > 0f)
-                    {
-                        a = a % mod;
-                        a = Mathf.Min(a, mod - a);
-                    }
-                    if (debugLogOrientationSweep)
-                    {
-                        Debug.Log($"[TangramMatcher]   -> diag({piece.name}) absOri={a:F1}°");
-                    }
-                    if (a < bestAng)
-                    {
-                        bestAng = a;
-                        bestPiece = piece;
-                    }
-                }
-                if (bestPiece != null)
-                {
-                    matchedPieceSet.Add(bestPiece);
-                    Vector3 planeN_abs = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
-                    Vector3 vAbs = Vector3.ProjectOnPlane(GetPieceCenterWorld(bestPiece) - det.worldPosition, planeN_abs);
-                    float absDist = vAbs.magnitude;
-                    lastMatchResults.Add(new MatchResult
-                    {
-                        shapeType = type,
-                        arucoId = det.arucoId,
-                        matchedPieceTransform = bestPiece,
-                        worldDistanceMeters = absDist,
-                        detectionWorldPosition = det.worldPosition,
-                        angleErrorDegrees = bestAng
-                    });
-                    if (debugLogOrientationDiff)
-                    {
-                        Debug.Log($"[TangramMatcher] ORI assign (single det) {type}:{det.arucoId} -> diag({bestPiece.name}) | absOri={bestAng:F1}°");
-                    }
-                }
-            }
-        }
-
-        // Error stats per type
-        ComputeAndStoreErrorStats();
-
-        ApplyDebugColors(matchedPieceSet);
-
-        // Draw debug lines for visual error
-        if (debugDrawErrorLines)
-        {
-            foreach (var seg in linkSegments)
-            {
-                float t = errorMaxForColor > 0f ? Mathf.Clamp01(seg.dist / errorMaxForColor) : 1f;
-                Color c = colorByErrorMagnitude ? Color.Lerp(errorLowColor, errorHighColor, t) : matchedColor;
-                Debug.DrawLine(seg.from, seg.to, c, 0f, false);
-            }
-        }
-
-        // Draw near-miss lines
-        if (debugDrawNearMissLines)
-        {
-            foreach (var seg in nearMissSegments)
-            {
-                Debug.DrawLine(seg.from, seg.to, nearMissLineColor, 0f, false);
-            }
-        }
-
-        // Update cached baselines ONCE per frame after matching
-        UpdateCachedBaselinesFromLastResults();
-
-        // 현재 프레임의 매칭 결과를 다음 프레임의 경고 억제에 사용하기 위해 저장
-        _matchedPiecesLastFrame.Clear();
-        foreach (var result in lastMatchResults)
-        {
-            _matchedPiecesLastFrame.Add(result.matchedPieceTransform);
-        }
-
-        // Debug log in English for clarity
-        foreach (var result in lastMatchResults)
-        {
-            string graphInfo = BuildGraphDebugInfo(result);
-            
-            // 상대 각도 정보 추가
-            string relativeAngleInfo = "";
-            if (debugLogRelativeAngles)
-            {
-                var detection = FindDetection(result.shapeType, result.arucoId);
-                if (detection.HasValue)
-                {
-                    // 이 감지된 도형의 회전을 기준으로 한 방향 벡터
-                    Vector3 detectionOrientation = detection.Value.worldRotation * Vector3.right;
-                    Vector3 pieceOrientation = result.matchedPieceTransform.rotation * Vector3.right;
-                    Vector3 planeN = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
-                    
-                    Vector3 detOrientProj = Vector3.ProjectOnPlane(detectionOrientation, planeN).normalized;
-                    Vector3 pieceOrientProj = Vector3.ProjectOnPlane(pieceOrientation, planeN).normalized;
-                    
-                    if (detOrientProj.sqrMagnitude > 1e-6f && pieceOrientProj.sqrMagnitude > 1e-6f)
-                    {
-                        float orientationDiff = Vector3.SignedAngle(pieceOrientProj, detOrientProj, planeN);
-                        relativeAngleInfo = $" | 방향차이={NormalizeAngle180(orientationDiff):F1}°";
-                    }
-                }
-            }
-            
-            Debug.Log($"[TangramMatcher] Matched {result.shapeType} (ArUco {result.arucoId}) -> Piece '{result.matchedPieceTransform.name}', distance = {result.worldDistanceMeters:F3} m, angle = {result.angleErrorDegrees:F1} deg{relativeAngleInfo}. {graphInfo}");
-            if (debugLogOrientationPerDetection && useAbsoluteOrientation)
-            {
-                // Report absolute orientation difference (independent of relations) for this detection vs its assigned piece
-                Vector3 planeN = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
-                var det = FindDetection(result.shapeType, result.arucoId);
-                if (det.HasValue)
-                {
-                    Vector3 detDir = Vector3.ProjectOnPlane(det.Value.worldRotation * Vector3.right, planeN).normalized;
-                    if (detDir.sqrMagnitude > 1e-6f)
-                    {
-                        // Matched piece ORI: use the precomputed angle (includes offsets/symmetry)
-                        float a = result.angleErrorDegrees;
-                        Debug.Log($"[TangramMatcher] ORI report {result.shapeType}:{result.arucoId} -> diag({result.matchedPieceTransform.name}) | absOri={a:F1}°");
-                        // Also report per-candidate ORI for same-type pieces when multiple exist
-                        if (diagramPiecesByType.TryGetValue(result.shapeType, out var pieces) && pieces != null)
-                        {
-                            int multi = 0; foreach (var p in pieces) if (p != null) multi++;
-                            if (multi >= 2)
-                            {
-                                foreach (var p in pieces)
-                                {
-                                    if (p == null) continue;
-                                    // Use the unified function so angleOffset and symmetry are applied consistently
-                                    float ang = ComputeAngleError(result.shapeType, det.Value.worldRotation, p);
-                                    Debug.Log($"[TangramMatcher] ORI candidate {result.shapeType}:{result.arucoId} vs diag({p.name}) | absOri={ang:F1}°");
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            if (debugAllDiagramEdges)
-            {
-                ReportAllDiagramEdgeDiffs(result, debugEdgesReportPerNode);
-            }
-            if (debugDetectionRelations)
-            {
-                ReportDetectionRelations(result, debugDetectionRelationsPerNode, drawDetectionRelationLines);
-            }
-        }
-
-        if (debugLogPerTypeErrorStats)
-        {
-            foreach (var kv in lastTypeErrorStats)
-            {
-                var s = kv.Value;
-                Debug.Log($"[TangramMatcher] Error stats for {kv.Key} -> count={s.count}, min={s.min:F3}m, max={s.max:F3}m, avg={s.avg:F3}m");
-            }
-        }
-
-        // Log all connection angles for comprehensive debugging (optional)
-        if (debugDetectionRelations)
-        {
-            DebugLogAllConnectionAngles();
-        }
-
-        // Flush REL logs at end of frame
-        if (relLogQueue.Count > 0)
-        {
-            // One-line header summarizing current angle offset settings for REL logs
-            Debug.Log($"[TangramMatcher] REL settings | angleOffset={angleOffset:F1}° conn={(applyOffsetToConnectionAngles ? 1 : 0)} ori={(applyOffsetToOrientations ? 1 : 0)}");
-            foreach (var line in relLogQueue) Debug.Log(line);
-            relLogQueue.Clear();
-        }
-
-        // Debug: current lock states
-        if (debugLogLockedStates && enableStatefulMatching)
-        {
-            foreach (var kv in lockedByPiece)
-            {
-                var ls = kv.Value;
-                string matched = "no";
-                foreach (var r in lastMatchResults) { if (r.matchedPieceTransform == ls.piece) { matched = $"det({r.shapeType}:{r.arucoId})"; break; } }
-                Debug.Log($"[TangramMatcher] LOCK {ls.piece.name} type={ls.type} locked={(ls.isLocked ? 1:0)} conf={ls.confidence:F2} lastSeen={ls.lastSeenFrame} matched={matched}");
-            }
-        }
-
-        // Update orientation arrows for markers
-        UpdateDetectionOrientationArrows();
-    }
-
-    private void ApplyDebugColors(HashSet<Transform> matchedPieces)
-    {
-        // First, update unmatched pieces
-        foreach (var kv in diagramPiecesByType)
-        {
-            foreach (Transform piece in kv.Value)
-            {
-                bool isMatchedOrLocked = matchedPieces.Contains(piece) || (enableStatefulMatching && lockedByPiece.TryGetValue(piece, out var ls0) && ls0.isLocked);
-                if (isMatchedOrLocked) continue;
-                if (useNeutralColorMode)
-                {
-                    SetRendererColor(piece.gameObject, neutralColor);
-                }
-                else
-                {
-                    if (highlightOnlyMatches)
-                        RestoreRendererOriginalColor(piece.gameObject);
-                    else
-                        SetRendererColor(piece.gameObject, unmatchedColor);
-                }
-            }
-        }
-
-        // Then, set matched pieces to color (optionally by error magnitude)
-        var colored = new HashSet<Transform>();
-        foreach (Transform piece in matchedPieces)
-        {
-            colored.Add(piece);
-            if (useNeutralColorMode && matchedRestoresOriginalColor)
-            {
-                RestoreRendererOriginalColor(piece.gameObject);
-            }
-            else if (colorByErrorMagnitude)
-            {
-                // Find distance for this piece from last results
-                float dist = 0f;
-                bool found = false;
-                foreach (var r in lastMatchResults)
-                {
-                    if (r.matchedPieceTransform == piece)
-                    {
-                        dist = r.worldDistanceMeters;
-                        found = true;
-                        break;
-                    }
-                }
-                if (found)
-                {
-                    float t = errorMaxForColor > 0f ? Mathf.Clamp01(dist / errorMaxForColor) : 1f;
-                    Color c = Color.Lerp(errorLowColor, errorHighColor, t);
-                    SetRendererColor(piece.gameObject, c);
-                }
-                else
-                {
-                    SetRendererColor(piece.gameObject, matchedColor);
-                }
-            }
-            else
-            {
-                SetRendererColor(piece.gameObject, matchedColor);
-            }
-        }
-
-        // Also color locked pieces not already colored this frame
-        if (enableStatefulMatching)
-        {
-            foreach (var kv in lockedByPiece)
-            {
-                var piece = kv.Key;
-                var ls = kv.Value;
-                if (!ls.isLocked) continue;
-                if (colored.Contains(piece)) continue;
-                if (useNeutralColorMode && matchedRestoresOriginalColor)
-                {
-                    RestoreRendererOriginalColor(piece.gameObject);
-                }
-                else
-                {
-                    SetRendererColor(piece.gameObject, matchedColor);
-                }
-            }
-        }
-    }
-
-    private void CaptureOriginalColors()
-    {
-        originalColorsByRenderer.Clear();
-        var candidateProps = string.IsNullOrEmpty(overrideColorProperty)
-            ? new[] { "_BaseColor", "_Color", "_TintColor" }
-            : new[] { overrideColorProperty };
-        foreach (var kv in diagramPiecesByType)
-        {
-            foreach (Transform piece in kv.Value)
-            {
-                var renderer = piece.GetComponent<MeshRenderer>();
-                if (renderer == null) continue;
-                var list = new List<SubMaterialColorInfo>();
-                var sharedMats = renderer.sharedMaterials;
-                for (int m = 0; m < sharedMats.Length; m++)
-                {
-                    var info = new SubMaterialColorInfo
-                    {
-                        propertyName = null,
-                        originalColor = Color.white,
-                        hasColorProperty = false,
-                        fallbackOriginalColor = Color.white
-                    };
-                    var sm = sharedMats[m];
-                    if (sm != null)
-                    {
-                        foreach (var prop in candidateProps)
-                        {
-                            if (sm.HasProperty(prop))
-                            {
-                                info.propertyName = prop;
-                                try { info.originalColor = sm.GetColor(prop); }
-                                catch { info.originalColor = Color.white; }
-                                info.hasColorProperty = true;
-                                break;
-                            }
-                        }
-                        // Fallback: try reading material.color via a temp instantiation-read pattern avoided; assume white if unknown
-                        try
-                        {
-                            // Note: sharedMaterial.color may not be valid if shader has no _Color
-                            info.fallbackOriginalColor = sm.color;
-                        }
-                        catch { info.fallbackOriginalColor = Color.white; }
-                    }
-                    list.Add(info);
-                }
-                originalColorsByRenderer[renderer] = list;
-            }
-        }
-    }
-
-    private void RestoreRendererOriginalColor(GameObject go)
-    {
-        var renderer = go.GetComponent<MeshRenderer>();
-        if (renderer == null) return;
-        if (!originalColorsByRenderer.TryGetValue(renderer, out var list)) return;
-
-        // Restore via property block or fallback material.color
-        for (int m = 0; m < list.Count; m++)
-        {
-            var info = list[m];
-            if (info.hasColorProperty && !string.IsNullOrEmpty(info.propertyName))
-            {
-                if (sharedPropertyBlock == null) sharedPropertyBlock = new MaterialPropertyBlock();
-                renderer.GetPropertyBlock(sharedPropertyBlock, m);
-                sharedPropertyBlock.SetColor(info.propertyName, info.originalColor);
-                renderer.SetPropertyBlock(sharedPropertyBlock, m);
-            }
-            else if (fallbackUseMaterialColorWhenNoProperty)
-            {
-                try
-                {
-                    var mats = renderer.materials;
-                    if (m < mats.Length && mats[m] != null)
-                    {
-                        mats[m].color = info.fallbackOriginalColor;
-                    }
-                }
-                catch { /* ignore */ }
-            }
-        }
-    }
-
     // ---------- Diagram Graph Construction ----------
     private void BuildDiagramGraph()
     {
@@ -1869,8 +1389,9 @@ public class TangramMatcher : MonoBehaviour
                     if (debugLogDiagramGraphAngles)
                     {
                         float legacyAngle = ComputePlanarAngleDeg(GetPieceCenterWorld(fromPiece), GetPieceCenterWorld(toPiece));
+                        // Debug output in English for diagram graph angle comparison between new and legacy methods
                         Debug.Log($"[DiagramGraph] {fromPiece.name} → {toPiece.name}: " +
-                                 $"새로운방식={angle:F2}°, 기존방식={legacyAngle:F2}°, 차이={Mathf.Abs(angle - legacyAngle):F2}°");
+                                  $"New method = {angle:F2}°, Legacy method = {legacyAngle:F2}°, Difference = {Mathf.Abs(angle - legacyAngle):F2}°");
                     }
                     var edge = new DiagramGraph.Edge
                     {
@@ -3224,41 +2745,66 @@ AUGMENT:
     /// <param name="toPiece">목표 조각의 Transform</param>
     /// <param name="debugContext">디버깅용 컨텍스트 정보</param>
     /// <returns>상대 각도 (degrees, -180 ~ 180)</returns>
+    /// <summary>
+    /// Computes the relative angle (in degrees) from the "fromPiece" to the "toPiece" on the diagram plane.
+    /// The angle is measured from the reference direction of the "fromPiece" (its local +X, or custom direction)
+    /// to the vector pointing from "fromPiece" to "toPiece", both projected onto the diagram plane.
+    /// </summary>
+    /// <param name="fromPiece">Transform of the reference piece</param>
+    /// <param name="toPiece">Transform of the target piece</param>
+    /// <param name="debugContext">Optional debug context for detailed logging</param>
+    /// <returns>Relative angle in degrees (-180 to 180)</returns>
     private float ComputeRelativeAngleDegForDiagram(Transform fromPiece, Transform toPiece, string debugContext = "")
     {
-        // 계산의 기준이 될 평면의 법선 벡터를 정의합니다.
+        // Define the normal vector of the plane used for angle calculation.
         Vector3 planeNormal = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
 
-        // 1. 기준 조각의 방향 벡터('center'->'direction')를 구합니다. 이것이 새로운 '0도' 기준선입니다.
+        // 1. Get the reference direction vector for the "fromPiece" (this is the new 0-degree baseline).
         Vector3 fromOrientationVec = GetPieceDirectionVector(fromPiece);
         Vector3 fromOrientationProj = Vector3.ProjectOnPlane(fromOrientationVec, planeNormal).normalized;
+
         if (fromOrientationProj.sqrMagnitude < 1e-6f)
         {
+            // Debug: Could not compute a valid reference direction vector.
             if (debugLogRelativeAngles && !string.IsNullOrEmpty(debugContext))
             {
-                Debug.LogWarning($"[RelativeAngleDiagram] {debugContext}: 기준 방향 벡터를 계산할 수 없음 - 0도 반환");
+                Debug.LogWarning($"[RelativeAngleDiagram] {debugContext}: Could not compute reference direction vector - returning 0 degrees.");
             }
             return 0f;
         }
 
-        // 2. 기준 조각에서 목표 조각으로 향하는 연결 벡터를 구합니다.
+        // 2. Compute the connection vector from "fromPiece" to "toPiece", projected onto the plane.
         Vector3 fromPos = GetPieceCenterWorld(fromPiece);
         Vector3 toPos = GetPieceCenterWorld(toPiece);
         Vector3 connectionVec = toPos - fromPos;
         Vector3 connectionVecProj = Vector3.ProjectOnPlane(connectionVec, planeNormal);
+
         if (connectionVecProj.sqrMagnitude < 1e-6f)
         {
+            // Debug: Connection vector is too short to define an angle.
             if (debugLogRelativeAngles && !string.IsNullOrEmpty(debugContext))
             {
-                Debug.LogWarning($"[RelativeAngleDiagram] {debugContext}: 연결 벡터가 너무 짧음 - 0도 반환");
+                Debug.LogWarning($"[RelativeAngleDiagram] {debugContext}: Connection vector is too short - returning 0 degrees.");
             }
             return 0f;
         }
         connectionVecProj.Normalize();
 
-        // 3. 기준 방향 벡터로부터 연결 벡터까지의 부호 있는 각도를 계산합니다.
+        // 3. Calculate the signed angle from the reference direction to the connection vector, on the plane.
         float relativeAngle = Vector3.SignedAngle(fromOrientationProj, connectionVecProj, planeNormal);
-        return NormalizeAngle180(relativeAngle);
+        float normalizedAngle = NormalizeAngle180(relativeAngle);
+
+        // Debug: Output detailed information if enabled.
+        if (debugLogRelativeAngles && !string.IsNullOrEmpty(debugContext))
+        {
+            Debug.Log($"[RelativeAngleDiagram] {debugContext}: " +
+                      $"fromPiece={fromPiece.name}, toPiece={toPiece.name}, " +
+                      $"referenceDir=({fromOrientationProj.x:F4},{fromOrientationProj.y:F4},{fromOrientationProj.z:F4}), " +
+                      $"connectionDir=({connectionVecProj.x:F4},{connectionVecProj.y:F4},{connectionVecProj.z:F4}), " +
+                      $"angle={normalizedAngle:F2}°");
+        }
+
+        return normalizedAngle;
     }
 
     /// <summary>
@@ -3616,7 +3162,7 @@ AUGMENT:
             return;
         }
         
-        Debug.Log($"[TangramMatcher] === Diagram Graph (상대 각도 기반) ===");
+        Debug.Log($"[TangramMatcher] === Diagram Graph (relative angle based) ===");
         Debug.Log($"노드 수: {diagramGraph.nodes.Count}");
         
         for (int i = 0; i < diagramGraph.nodes.Count; i++)
@@ -3627,11 +3173,10 @@ AUGMENT:
             Vector3 pieceEuler = n.piece.transform.rotation.eulerAngles;
             
             Debug.Log($"[{i}] {n.piece.name} (ArUco ID: {pieceId})");
-            Debug.Log($"    위치: ({centerPos.x:F3}, {centerPos.y:F3}, {centerPos.z:F3})");
-            Debug.Log($"    회전: ({pieceEuler.x:F1}°, {pieceEuler.y:F1}°, {pieceEuler.z:F1}°)");
-            Debug.Log($"    크기: {n.sizeMeters:F3}m");
-            Debug.Log($"    연결된 엣지 수: {n.edges.Count}");
-            
+            Debug.Log($"    Position: ({centerPos.x:F3}, {centerPos.y:F3}, {centerPos.z:F3})");
+            Debug.Log($"    Rotation: ({pieceEuler.x:F1}°, {pieceEuler.y:F1}°, {pieceEuler.z:F1}°)");
+            Debug.Log($"    Size: {n.sizeMeters:F3}m");
+            Debug.Log($"    Number of connected edges: {n.edges.Count}");
             for (int e = 0; e < n.edges.Count; e++)
             {
                 var ed = n.edges[e];
@@ -3644,19 +3189,19 @@ AUGMENT:
                 float angleDiff = Mathf.Abs(NormalizeAngle180(ed.expectedAngleDeg - legacyAngle));
                 
                 Debug.Log($"    -> {to.name} (ArUco ID: {toId})");
-                Debug.Log($"       거리: {ed.expectedDistanceMeters:F3}m");
-                Debug.Log($"       상대각도: {ed.expectedAngleDeg:F2}° (기존방식: {legacyAngle:F2}°, 차이: {angleDiff:F2}°)");
-                Debug.Log($"       정규화거리: {ed.normalizedDistance:F3}");
-                Debug.Log($"       목표위치: ({toCenterPos.x:F3}, {toCenterPos.y:F3}, {toCenterPos.z:F3})");
+                Debug.Log($"       Distance: {ed.expectedDistanceMeters:F3}m");
+                Debug.Log($"       Relative angle: {ed.expectedAngleDeg:F2}° (legacy: {legacyAngle:F2}°, diff: {angleDiff:F2}°)");
+                Debug.Log($"       Normalized distance: {ed.normalizedDistance:F3}");
+                Debug.Log($"       Target position: ({toCenterPos.x:F3}, {toCenterPos.y:F3}, {toCenterPos.z:F3})");
             }
             
             if (n.edges.Count == 0)
             {
-                Debug.Log($"    (연결된 엣지 없음)");
+                Debug.Log($"    (No connected edges)");
             }
         }
         
-        Debug.Log($"=== Diagram Graph 완료 ===");
+        Debug.Log($"=== Diagram Graph complete ===");
     }
 
     /// <summary>
@@ -3664,35 +3209,38 @@ AUGMENT:
     /// </summary>
     private void DebugLogDetectionRelationsSummary()
     {
+        // If detailed relative angle debugging is not enabled, or there are not enough detections, exit early.
         if (!debugLogRelativeAngles || latestDetections == null || latestDetections.Count < 2)
             return;
 
-        Debug.Log($"[TangramMatcher] === 감지된 도형들의 상대 각도 관계 요약 ===");
-        Debug.Log($"감지된 도형 수: {latestDetections.Count}");
+        Debug.Log($"[TangramMatcher] === Summary of Relative Angles Between Detected Shapes ===");
+        Debug.Log($"Number of detected shapes: {latestDetections.Count}");
 
+        // Filter out corner detections, as we only want to analyze non-corner shapes.
         var nonCornerDetections = new List<DetectedShape>();
         foreach (var det in latestDetections)
         {
             if (!det.isCorner) nonCornerDetections.Add(det);
         }
 
-        Debug.Log($"비-코너 도형 수: {nonCornerDetections.Count}");
+        Debug.Log($"Number of non-corner shapes: {nonCornerDetections.Count}");
 
         for (int i = 0; i < nonCornerDetections.Count; i++)
         {
             var detA = nonCornerDetections[i];
             Vector3 eulerA = detA.worldRotation.eulerAngles;
-            
-            Debug.Log($"[{i}] {detA.shapeType}:{detA.arucoId}");
-            Debug.Log($"    위치: ({detA.worldPosition.x:F3}, {detA.worldPosition.y:F3}, {detA.worldPosition.z:F3})");
-            Debug.Log($"    회전: ({eulerA.x:F1}°, {eulerA.y:F1}°, {eulerA.z:F1}°)");
-            Debug.Log($"    평면좌표: ({detA.planeCoord.x:F3}, {detA.planeCoord.y:F3})");
-            Debug.Log($"    평면각도: {detA.planeAngleDeg:F2}°");
 
-            // 다른 도형들과의 관계
+            Debug.Log($"[{i}] {detA.shapeType}:{detA.arucoId}");
+            Debug.Log($"    Position: ({detA.worldPosition.x:F3}, {detA.worldPosition.y:F3}, {detA.worldPosition.z:F3})");
+            Debug.Log($"    Rotation (Euler angles): ({eulerA.x:F1}°, {eulerA.y:F1}°, {eulerA.z:F1}°)");
+            Debug.Log($"    Plane coordinates: ({detA.planeCoord.x:F3}, {detA.planeCoord.y:F3})");
+            Debug.Log($"    Plane angle: {detA.planeAngleDeg:F2}°");
+
+            // Log relationships to all subsequent non-corner shapes (to avoid duplicate pairs)
             for (int j = i + 1; j < nonCornerDetections.Count; j++)
             {
                 var detB = nonCornerDetections[j];
+                // Always order by arucoId for consistency in debug output
                 var fromDet = (detA.arucoId <= detB.arucoId) ? detA : detB;
                 var toDet = (detA.arucoId <= detB.arucoId) ? detB : detA;
 
@@ -3704,12 +3252,12 @@ AUGMENT:
                 );
 
                 float distance = Vector3.Distance(detA.worldPosition, detB.worldPosition);
-                
-                Debug.Log($"    -> {detB.shapeType}:{detB.arucoId}: 거리={distance:F3}m, 상대각도={relativeAngle:F2}°");
+
+                Debug.Log($"    -> {detB.shapeType}:{detB.arucoId}: Distance={distance:F3}m, Relative angle={relativeAngle:F2}°");
             }
         }
 
-        Debug.Log($"=== 감지된 도형 관계 요약 완료 ===");
+        Debug.Log($"=== Summary of detected shape relationships complete ===");
     }
 
     private void ComputeAndStoreErrorStats()
@@ -4907,10 +4455,10 @@ AUGMENT:
                     $"EXPECTED {fromPiece.name} → {toPiece.name}" : "";
 
                 // ★ 변경점: 정답 조각들의 '기대' 관계 각도를 새로운 상대 각도 방식으로 계산합니다.
-                float expectedConnectionAngle = ComputeRelativeAngleDeg(
-                    GetPieceCenterWorld(fromPiece),
-                    fromPiece.transform.rotation,
-                    GetPieceCenterWorld(toPiece),
+                // Use the same method as diagram building for consistency
+                float expectedConnectionAngle = ComputeRelativeAngleDegForDiagram(
+                    fromPiece,
+                    toPiece,
                     diagramDebugContext
                 );
 
@@ -4918,11 +4466,12 @@ AUGMENT:
                 if (debugLogAngleComparison)
                 {
                     float angleDifference = Mathf.Abs(NormalizeAngle180(actualConnectionAngle - expectedConnectionAngle));
+                    // Debug output in English for angle comparison between detected shapes and diagram pieces
                     Debug.Log($"[AngleComparison] {fromDet.shapeType}:{fromDet.arucoId} → {toDet.shapeType}:{toDet.arucoId}\n" +
-                             $"  실제각도: {actualConnectionAngle:F2}° (감지된 도형들)\n" +
-                             $"  기대각도: {expectedConnectionAngle:F2}° (다이어그램 조각들)\n" +
-                             $"  각도차이: {angleDifference:F2}° (허용범위: {relationMaxAngleDiffDeg:F1}°)\n" +
-                             $"  결과: {(angleDifference <= relationMaxAngleDiffDeg ? "PASS" : "FAIL")}");
+                              $"  Actual angle: {actualConnectionAngle:F2}° (between detected shapes)\n" +
+                              $"  Expected angle: {expectedConnectionAngle:F2}° (between diagram pieces)\n" +
+                              $"  Angle difference: {angleDifference:F2}° (tolerance: {relationMaxAngleDiffDeg:F1}°)\n" +
+                              $"  Result: {(angleDifference <= relationMaxAngleDiffDeg ? "PASS" : "FAIL")}");
                 }
                 // Apply first-pass direction offset if available
                 if (useFirstPassDirectionOffset && firstPassDirOffsetValid)
@@ -4946,9 +4495,11 @@ AUGMENT:
                     // Lock first-pass direction offset when requested and not yet set: set offset so expected+offset equals actual
                     if (useFirstPassDirectionOffset && pass && !firstPassDirOffsetValid)
                     {
+                        // Use the same angle calculation method as diagram building for consistency
+                        // Instead of ComputeConnectionLineAngleFromCoords (legacy method), use the new method
                         float baseExp = (A.arucoId <= B.arucoId)
-                            ? ComputeConnectionLineAngleFromCoords(pACoord, pBCoord)
-                            : ComputeConnectionLineAngleFromCoords(pBCoord, pACoord);
+                            ? ComputeRelativeAngleDegForDiagram(pA, pB, "DirectionOffsetCalc")
+                            : ComputeRelativeAngleDegForDiagram(pB, pA, "DirectionOffsetCalc");
                         firstPassDirOffsetDeg = NormalizeAngle180(actualConnectionAngle - baseExp);
                         firstPassDirOffsetValid = true;
                         firstPassDirOffsetFrame = frameCounter;
@@ -5020,9 +4571,10 @@ AUGMENT:
                         // If angle gating was ignored and overall pass achieved, lock direction offset now
                         if (useFirstPassDirectionOffset && !firstPassDirOffsetValid && pass)
                         {
+                            // Use the same angle calculation method as diagram building for consistency
                             float baseExp2 = (A.arucoId <= B.arucoId)
-                                ? ComputeConnectionLineAngleFromCoords(pACoord, pBCoord)
-                                : ComputeConnectionLineAngleFromCoords(pBCoord, pACoord);
+                                ? ComputeRelativeAngleDegForDiagram(pA, pB, "DirectionOffsetCalc2")
+                                : ComputeRelativeAngleDegForDiagram(pB, pA, "DirectionOffsetCalc2");
                             firstPassDirOffsetDeg = NormalizeAngle180(actualConnectionAngle - baseExp2);
                             firstPassDirOffsetValid = true;
                             firstPassDirOffsetFrame = frameCounter;
@@ -5782,6 +5334,486 @@ AUGMENT:
             }
         }
         catch { /* defensive: do nothing on exceptions */ }
+    }
+
+    /// <summary>
+    /// Compute matches and apply debug coloring.
+    /// </summary>
+    private void RunMatchingAndHighlight()
+    {
+        lastMatchResults.Clear();
+
+        // 상대 각도 디버깅: 감지된 도형들의 관계 요약 출력
+        if (debugLogRelativeAngles)
+        {
+            DebugLogDetectionRelationsSummary();
+        }
+
+        // Build available piece lists per type
+        var availablePieces = new Dictionary<TangramShapeType, List<Transform>>();
+        foreach (var kv in diagramPiecesByType)
+        {
+            availablePieces[kv.Key] = new List<Transform>(kv.Value);
+        }
+
+        var matchedPieceSet = new HashSet<Transform>();
+
+        var linkSegments = new List<(Vector3 from, Vector3 to, float dist, Transform piece, TangramShapeType type, int id)>();
+        // Collect near-miss segments in a local list, pass by reference where needed
+        var nearMissSegments = new List<(Vector3 from, Vector3 to, float dist, Transform piece, TangramShapeType type, int id)>();
+
+        // Orientation-only PRE-ASSIGNMENT: if a shape type has exactly one detection but multiple diagram pieces
+        // of that type exist, assign it solely by absolute orientation BEFORE graph matching to avoid relation bias.
+        if (forceOrientationForSingleDetection && useAbsoluteOrientation)
+        {
+            var detectionsByTypePre = new Dictionary<TangramShapeType, List<int>>();
+            for (int i = 0; i < latestDetections.Count; i++)
+            {
+                var d = latestDetections[i];
+                if (d.isCorner) continue;
+                if (!detectionsByTypePre.TryGetValue(d.shapeType, out var list))
+                {
+                    list = new List<int>();
+                    detectionsByTypePre[d.shapeType] = list;
+                }
+                list.Add(i);
+            }
+            foreach (var kv in detectionsByTypePre)
+            {
+                var type = kv.Key;
+                var list = kv.Value;
+                if (list.Count != 1) continue;
+                if (!availablePieces.TryGetValue(type, out var candidates) || candidates == null) continue;
+                // Consider all currently available (unmatched/unlocked) pieces of this type
+                var remaining = new List<Transform>(candidates);
+                if (remaining.Count <= 1) continue;
+
+                int detIndex = list[0];
+                var det = latestDetections[detIndex];
+                float bestAng = float.PositiveInfinity;
+                Transform bestPiece = null;
+                foreach (var piece in remaining)
+                {
+                    if (piece == null) continue;
+                    float a = ComputeAngleError(type, det.worldRotation, piece);
+                    if (a < bestAng)
+                    {
+                        bestAng = a;
+                        bestPiece = piece;
+                    }
+                }
+                if (bestPiece != null)
+                {
+                    // Use preAssignedDetections so downstream matching treats it as fixed
+                    preAssignedDetections[detIndex] = bestPiece;
+                    if (debugLogOrientationDiff)
+                    {
+                        Debug.Log($"[TangramMatcher] ORI preassign (single det) {type}:{det.arucoId} -> diag({bestPiece.name}) | absOri={bestAng:F1}°");
+                    }
+                }
+            }
+        }
+
+        // Absolute greedy matching removed – use graph-only matching
+        RunGraphOnlyMatching(availablePieces, matchedPieceSet, linkSegments);
+
+        // Orientation-only assignment fallback:
+        // If a shape type has exactly 1 detection and multiple diagram pieces remain for that type,
+        // assign it to the piece with the smallest absolute orientation difference (ignoring relations),
+        // but only if the piece is not already matched in this frame.
+        if ((forceOrientationForSingleDetection ) && useAbsoluteOrientation)
+        {
+            var detectionsByType = new Dictionary<TangramShapeType, List<int>>();
+            for (int i = 0; i < latestDetections.Count; i++)
+            {
+                var d = latestDetections[i];
+                if (d.isCorner) continue;
+                if (!detectionsByType.TryGetValue(d.shapeType, out var list))
+                {
+                    list = new List<int>();
+                    detectionsByType[d.shapeType] = list;
+                }
+                list.Add(i);
+            }
+            foreach (var kv in detectionsByType)
+            {
+                var type = kv.Key;
+                var list = kv.Value;
+                if (list.Count != 1) continue;
+                // Collect remaining unmatched diagram pieces of this type
+                if (!diagramPiecesByType.TryGetValue(type, out var allPieces)) continue;
+                var remaining = new List<Transform>();
+                foreach (var p in allPieces) if (!matchedPieceSet.Contains(p)) remaining.Add(p);
+                if (remaining.Count <= 1) continue;
+
+                int detIndex = list[0];
+                var det = latestDetections[detIndex];
+                Vector3 planeN = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
+                Vector3 detDir = Vector3.ProjectOnPlane(det.worldRotation * Vector3.right, planeN).normalized;
+                if (detDir.sqrMagnitude < 1e-6f) continue;
+
+                float bestAng = float.PositiveInfinity;
+                Transform bestPiece = null;
+                if (debugLogOrientationSweep)
+                {
+                    Debug.Log($"[TangramMatcher] ORI sweep for det({type}:{det.arucoId}) vs {remaining.Count} candidates");
+                }
+                foreach (var piece in remaining)
+                {
+                    Vector3 pieceDir = Vector3.ProjectOnPlane(GetPieceDirectionVector(piece), planeN).normalized;
+                    if (pieceDir.sqrMagnitude < 1e-6f) continue;
+                    float a = Mathf.Abs(Vector3.SignedAngle(pieceDir, detDir, planeN));
+                    a = NormalizeAngle180(a);
+                    float mod = GetSymmetryModuloDegrees(type);
+                    if (mod > 0f)
+                    {
+                        a = a % mod;
+                        a = Mathf.Min(a, mod - a);
+                    }
+                    if (debugLogOrientationSweep)
+                    {
+                        Debug.Log($"[TangramMatcher]   -> diag({piece.name}) absOri={a:F1}°");
+                    }
+                    if (a < bestAng)
+                    {
+                        bestAng = a;
+                        bestPiece = piece;
+                    }
+                }
+                if (bestPiece != null)
+                {
+                    matchedPieceSet.Add(bestPiece);
+                    Vector3 planeN_abs = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
+                    Vector3 vAbs = Vector3.ProjectOnPlane(GetPieceCenterWorld(bestPiece) - det.worldPosition, planeN_abs);
+                    float absDist = vAbs.magnitude;
+                    lastMatchResults.Add(new MatchResult
+                    {
+                        shapeType = type,
+                        arucoId = det.arucoId,
+                        matchedPieceTransform = bestPiece,
+                        worldDistanceMeters = absDist,
+                        detectionWorldPosition = det.worldPosition,
+                        angleErrorDegrees = bestAng
+                    });
+                    if (debugLogOrientationDiff)
+                    {
+                        Debug.Log($"[TangramMatcher] ORI assign (single det) {type}:{det.arucoId} -> diag({bestPiece.name}) | absOri={bestAng:F1}°");
+                    }
+                }
+            }
+        }
+
+        // Error stats per type
+        ComputeAndStoreErrorStats();
+
+        ApplyDebugColors(matchedPieceSet);
+
+        // Draw debug lines for visual error
+        if (debugDrawErrorLines)
+        {
+            foreach (var seg in linkSegments)
+            {
+                float t = errorMaxForColor > 0f ? Mathf.Clamp01(seg.dist / errorMaxForColor) : 1f;
+                Color c = colorByErrorMagnitude ? Color.Lerp(errorLowColor, errorHighColor, t) : matchedColor;
+                Debug.DrawLine(seg.from, seg.to, c, 0f, false);
+            }
+        }
+
+        // Draw near-miss lines
+        if (debugDrawNearMissLines)
+        {
+            foreach (var seg in nearMissSegments)
+            {
+                Debug.DrawLine(seg.from, seg.to, nearMissLineColor, 0f, false);
+            }
+        }
+
+        // Update cached baselines ONCE per frame after matching
+        UpdateCachedBaselinesFromLastResults();
+
+        // 현재 프레임의 매칭 결과를 다음 프레임의 경고 억제에 사용하기 위해 저장
+        _matchedPiecesLastFrame.Clear();
+        foreach (var result in lastMatchResults)
+        {
+            _matchedPiecesLastFrame.Add(result.matchedPieceTransform);
+        }
+
+        // Debug log in English for clarity
+        foreach (var result in lastMatchResults)
+        {
+            string graphInfo = BuildGraphDebugInfo(result);
+            
+            // 상대 각도 정보 추가
+            string relativeAngleInfo = "";
+            if (debugLogRelativeAngles)
+            {
+                var detection = FindDetection(result.shapeType, result.arucoId);
+                if (detection.HasValue)
+                {
+                    // 이 감지된 도형의 회전을 기준으로 한 방향 벡터
+                    Vector3 detectionOrientation = detection.Value.worldRotation * Vector3.right;
+                    Vector3 pieceOrientation = result.matchedPieceTransform.rotation * Vector3.right;
+                    Vector3 planeN = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
+                    
+                    Vector3 detOrientProj = Vector3.ProjectOnPlane(detectionOrientation, planeN).normalized;
+                    Vector3 pieceOrientProj = Vector3.ProjectOnPlane(pieceOrientation, planeN).normalized;
+                    
+                    if (detOrientProj.sqrMagnitude > 1e-6f && pieceOrientProj.sqrMagnitude > 1e-6f)
+                    {
+                        float orientationDiff = Vector3.SignedAngle(pieceOrientProj, detOrientProj, planeN);
+                        relativeAngleInfo = $" | 방향차이={NormalizeAngle180(orientationDiff):F1}°";
+                    }
+                }
+            }
+            
+            Debug.Log($"[TangramMatcher] Matched {result.shapeType} (ArUco {result.arucoId}) -> Piece '{result.matchedPieceTransform.name}', distance = {result.worldDistanceMeters:F3} m, angle = {result.angleErrorDegrees:F1} deg{relativeAngleInfo}. {graphInfo}");
+            if (debugLogOrientationPerDetection && useAbsoluteOrientation)
+            {
+                // Report absolute orientation difference (independent of relations) for this detection vs its assigned piece
+                Vector3 planeN = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
+                var det = FindDetection(result.shapeType, result.arucoId);
+                if (det.HasValue)
+                {
+                    Vector3 detDir = Vector3.ProjectOnPlane(det.Value.worldRotation * Vector3.right, planeN).normalized;
+                    if (detDir.sqrMagnitude > 1e-6f)
+                    {
+                        // Matched piece ORI: use the precomputed angle (includes offsets/symmetry)
+                        float a = result.angleErrorDegrees;
+                        Debug.Log($"[TangramMatcher] ORI report {result.shapeType}:{result.arucoId} -> diag({result.matchedPieceTransform.name}) | absOri={a:F1}°");
+                        // Also report per-candidate ORI for same-type pieces when multiple exist
+                        if (diagramPiecesByType.TryGetValue(result.shapeType, out var pieces) && pieces != null)
+                        {
+                            int multi = 0; foreach (var p in pieces) if (p != null) multi++;
+                            if (multi >= 2)
+                            {
+                                foreach (var p in pieces)
+                                {
+                                    if (p == null) continue;
+                                    // Use the unified function so angleOffset and symmetry are applied consistently
+                                    float ang = ComputeAngleError(result.shapeType, det.Value.worldRotation, p);
+                                    Debug.Log($"[TangramMatcher] ORI candidate {result.shapeType}:{result.arucoId} vs diag({p.name}) | absOri={ang:F1}°");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if (debugAllDiagramEdges)
+            {
+                ReportAllDiagramEdgeDiffs(result, debugEdgesReportPerNode);
+            }
+            if (debugDetectionRelations)
+            {
+                ReportDetectionRelations(result, debugDetectionRelationsPerNode, drawDetectionRelationLines);
+            }
+        }
+
+        if (debugLogPerTypeErrorStats)
+        {
+            foreach (var kv in lastTypeErrorStats)
+            {
+                var s = kv.Value;
+                Debug.Log($"[TangramMatcher] Error stats for {kv.Key} -> count={s.count}, min={s.min:F3}m, max={s.max:F3}m, avg={s.avg:F3}m");
+            }
+        }
+
+        // Log all connection angles for comprehensive debugging (optional)
+        if (debugDetectionRelations)
+        {
+            DebugLogAllConnectionAngles();
+        }
+
+        // Flush REL logs at end of frame
+        if (relLogQueue.Count > 0)
+        {
+            // One-line header summarizing current angle offset settings for REL logs
+            Debug.Log($"[TangramMatcher] REL settings | angleOffset={angleOffset:F1}° conn={(applyOffsetToConnectionAngles ? 1 : 0)} ori={(applyOffsetToOrientations ? 1 : 0)}");
+            foreach (var line in relLogQueue) Debug.Log(line);
+            relLogQueue.Clear();
+        }
+
+        // Debug: current lock states
+        if (debugLogLockedStates && enableStatefulMatching)
+        {
+            foreach (var kv in lockedByPiece)
+            {
+                var ls = kv.Value;
+                string matched = "no";
+                foreach (var r in lastMatchResults) { if (r.matchedPieceTransform == ls.piece) { matched = $"det({r.shapeType}:{r.arucoId})"; break; } }
+                Debug.Log($"[TangramMatcher] LOCK {ls.piece.name} type={ls.type} locked={(ls.isLocked ? 1:0)} conf={ls.confidence:F2} lastSeen={ls.lastSeenFrame} matched={matched}");
+            }
+        }
+
+        // Update orientation arrows for markers
+        UpdateDetectionOrientationArrows();
+    }
+
+    private void ApplyDebugColors(HashSet<Transform> matchedPieces)
+    {
+        // First, update unmatched pieces
+        foreach (var kv in diagramPiecesByType)
+        {
+            foreach (Transform piece in kv.Value)
+            {
+                bool isMatchedOrLocked = matchedPieces.Contains(piece) || (enableStatefulMatching && lockedByPiece.TryGetValue(piece, out var ls0) && ls0.isLocked);
+                if (isMatchedOrLocked) continue;
+                if (useNeutralColorMode)
+                {
+                    SetRendererColor(piece.gameObject, neutralColor);
+                }
+                else
+                {
+                    if (highlightOnlyMatches)
+                        RestoreRendererOriginalColor(piece.gameObject);
+                    else
+                        SetRendererColor(piece.gameObject, unmatchedColor);
+                }
+            }
+        }
+
+        // Then, set matched pieces to color (optionally by error magnitude)
+        var colored = new HashSet<Transform>();
+        foreach (Transform piece in matchedPieces)
+        {
+            colored.Add(piece);
+            if (useNeutralColorMode && matchedRestoresOriginalColor)
+            {
+                RestoreRendererOriginalColor(piece.gameObject);
+            }
+            else if (colorByErrorMagnitude)
+            {
+                // Find distance for this piece from last results
+                float dist = 0f;
+                bool found = false;
+                foreach (var r in lastMatchResults)
+                {
+                    if (r.matchedPieceTransform == piece)
+                    {
+                        dist = r.worldDistanceMeters;
+                        found = true;
+                        break;
+                    }
+                }
+                if (found)
+                {
+                    float t = errorMaxForColor > 0f ? Mathf.Clamp01(dist / errorMaxForColor) : 1f;
+                    Color c = Color.Lerp(errorLowColor, errorHighColor, t);
+                    SetRendererColor(piece.gameObject, c);
+                }
+                else
+                {
+                    SetRendererColor(piece.gameObject, matchedColor);
+                }
+            }
+            else
+            {
+                SetRendererColor(piece.gameObject, matchedColor);
+            }
+        }
+
+        // Also color locked pieces not already colored this frame
+        if (enableStatefulMatching)
+        {
+            foreach (var kv in lockedByPiece)
+            {
+                var piece = kv.Key;
+                var ls = kv.Value;
+                if (!ls.isLocked) continue;
+                if (colored.Contains(piece)) continue;
+                if (useNeutralColorMode && matchedRestoresOriginalColor)
+                {
+                    RestoreRendererOriginalColor(piece.gameObject);
+                }
+                else
+                {
+                    SetRendererColor(piece.gameObject, matchedColor);
+                }
+            }
+        }
+    }
+
+    private void CaptureOriginalColors()
+    {
+        originalColorsByRenderer.Clear();
+        var candidateProps = string.IsNullOrEmpty(overrideColorProperty)
+            ? new[] { "_BaseColor", "_Color", "_TintColor" }
+            : new[] { overrideColorProperty };
+        foreach (var kv in diagramPiecesByType)
+        {
+            foreach (Transform piece in kv.Value)
+            {
+                var renderer = piece.GetComponent<MeshRenderer>();
+                if (renderer == null) continue;
+                var list = new List<SubMaterialColorInfo>();
+                var sharedMats = renderer.sharedMaterials;
+                for (int m = 0; m < sharedMats.Length; m++)
+                {
+                    var info = new SubMaterialColorInfo
+                    {
+                        propertyName = null,
+                        originalColor = Color.white,
+                        hasColorProperty = false,
+                        fallbackOriginalColor = Color.white
+                    };
+                    var sm = sharedMats[m];
+                    if (sm != null)
+                    {
+                        foreach (var prop in candidateProps)
+                        {
+                            if (sm.HasProperty(prop))
+                            {
+                                info.propertyName = prop;
+                                try { info.originalColor = sm.GetColor(prop); }
+                                catch { info.originalColor = Color.white; }
+                                info.hasColorProperty = true;
+                                break;
+                            }
+                        }
+                        // Fallback: try reading material.color via a temp instantiation-read pattern avoided; assume white if unknown
+                        try
+                        {
+                            // Note: sharedMaterial.color may not be valid if shader has no _Color
+                            info.fallbackOriginalColor = sm.color;
+                        }
+                        catch { info.fallbackOriginalColor = Color.white; }
+                    }
+                    list.Add(info);
+                }
+                originalColorsByRenderer[renderer] = list;
+            }
+        }
+    }
+
+    private void RestoreRendererOriginalColor(GameObject go)
+    {
+        var renderer = go.GetComponent<MeshRenderer>();
+        if (renderer == null) return;
+        if (!originalColorsByRenderer.TryGetValue(renderer, out var list)) return;
+
+        // Restore via property block or fallback material.color
+        for (int m = 0; m < list.Count; m++)
+        {
+            var info = list[m];
+            if (info.hasColorProperty && !string.IsNullOrEmpty(info.propertyName))
+            {
+                if (sharedPropertyBlock == null) sharedPropertyBlock = new MaterialPropertyBlock();
+                renderer.GetPropertyBlock(sharedPropertyBlock, m);
+                sharedPropertyBlock.SetColor(info.propertyName, info.originalColor);
+                renderer.SetPropertyBlock(sharedPropertyBlock, m);
+            }
+            else if (fallbackUseMaterialColorWhenNoProperty)
+            {
+                try
+                {
+                    var mats = renderer.materials;
+                    if (m < mats.Length && mats[m] != null)
+                    {
+                        mats[m].color = info.fallbackOriginalColor;
+                    }
+                }
+                catch { /* ignore */ }
+            }
+        }
     }
 }
 
