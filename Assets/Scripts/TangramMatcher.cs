@@ -15,6 +15,12 @@ using OpenCVForUnity.Calib3dModule;
 /// - Attach to a GameObject and assign `tangramDiagramRoot` (defaults to this.transform)
 /// - Feed detections every frame via SetDetections(...) or UpdateFromArucoMats(...)
 /// - The component will compute nearest-neighbor matches by shape type and color matched pieces.
+/// 
+/// RECENT IMPROVEMENTS (2024):
+/// - Fixed inconsistent angle calculation methods in error reporting and relation checking
+/// - Error reporting now uses the same ComputeRelativeAngleDeg/ComputeRelativeAngleDegForDiagram functions
+/// - This ensures consistency between matching logic and error reporting
+/// - Added debug logging for the new angle calculation methods when debugLogRelativeAngles is enabled
 /// </summary>
 public class TangramMatcher : MonoBehaviour
 {
@@ -176,8 +182,13 @@ public class TangramMatcher : MonoBehaviour
     [Header("Lock Policy")]
     [Tooltip("Require at least one passing relation (vs matched neighbors on diagram edges) for a piece to gain lock confidence.")]
     public bool requireRelationPassForLock = true;
-    [Tooltip("When requiring relation pass for lock, demand all diagram-edge relations to matched neighbors to pass (true) or any one to pass (false).")]
+    [Tooltip("When requiring relation pass for lock, demand all diagram-edge relations to matched neighbors to pass (true) or any one to pass (false). If false, use minimum neighbor count requirement instead.")]
     public bool relationLockRequireAllNeighbors = false;
+    
+    [Tooltip("Minimum number of neighbors that must pass relation checks (when relationLockRequireAllNeighbors is false)")]
+    [Range(1, 5)]
+    public int minNeighborsForLocked = 1;
+    
     [Tooltip("Log relation pass/fail decisions that affect locking.")]
     public bool debugLogLockRelationDecision = true;
     [Tooltip("Immediately set lock (confidence=1.0) when relation pass condition is satisfied, instead of gradual confidence gain.")]
@@ -441,6 +452,7 @@ public class TangramMatcher : MonoBehaviour
         public Transform matchedPieceTransform;
         public float worldDistanceMeters;
         public Vector3 detectionWorldPosition;
+        public Quaternion detectionWorldRotation; // ★ 추가: 감지된 도형의 월드 회전을 저장하여 상대 각도 계산에 사용
         public float angleErrorDegrees;
     }
 
@@ -1609,6 +1621,7 @@ public class TangramMatcher : MonoBehaviour
                         matchedPieceTransform = lockedPiece,
                         worldDistanceMeters = absDist,
                         detectionWorldPosition = det.worldPosition,
+                        detectionWorldRotation = det.worldRotation, // ★ 추가: 감지된 도형의 회전 정보 저장
                         angleErrorDegrees = absAng
                     });
                     continue;
@@ -1907,6 +1920,7 @@ public class TangramMatcher : MonoBehaviour
                                     matchedPieceTransform = piece,
                                     worldDistanceMeters = pr.d,
                                     detectionWorldPosition = det.worldPosition,
+                                    detectionWorldRotation = det.worldRotation, // ★ 추가: 감지된 도형의 회전 정보 저장
                                     angleErrorDegrees = pr.a
                                 });
                     linkSegments.Add((det.worldPosition, GetPieceCenterWorld(piece), pr.d, piece, det.shapeType, det.arucoId));
@@ -2077,6 +2091,7 @@ public class TangramMatcher : MonoBehaviour
                     matchedPieceTransform = chosen,
                     worldDistanceMeters = absDist,
                     detectionWorldPosition = det.worldPosition,
+                    detectionWorldRotation = det.worldRotation, // ★ 추가: 감지된 도형의 회전 정보 저장
                     angleErrorDegrees = absAng
                 });
                 linkSegments.Add((det.worldPosition, chosen.position, chosenAvgDistDiff, chosen, det.shapeType, det.arucoId));
@@ -2093,14 +2108,51 @@ public class TangramMatcher : MonoBehaviour
                     if (!diagramGraph.indexByTransform.TryGetValue(neighborPiece, out int dj)) continue;
                     if (!IsDiagramEdge(di, dj)) continue;
                 }
+                    // ★ 변경점: 새로운 일관된 상대 각도 계산 함수를 사용하여 관계 검증의 정확성을 향상시킵니다.
+                    // Use the new, consistent relative angle calculation functions for relation validation accuracy
+                    
+                    // For detection positions, we need to find the detection's rotation
+                    Quaternion detRot = Quaternion.identity;
+                    Quaternion neighDetRot = Quaternion.identity;
+                    foreach (var r in lastMatchResults)
+                    {
+                        if (r.matchedPieceTransform == chosen)
+                        {
+                            detRot = r.detectionWorldRotation;
+                        }
+                        if (r.matchedPieceTransform == neighborPiece)
+                        {
+                            neighDetRot = r.detectionWorldRotation;
+                        }
+                    }
+                    
+                    // Calculate expected angle from diagram using the new function
+                    float expectedAngle = ComputeRelativeAngleDegForDiagram(chosen, neighborPiece, 
+                        $"RelationCheck_{chosen.name}_to_{neighborPiece.name}");
+                    
+                    // Calculate actual angle from detection using the new function
+                    float actualAngle = ComputeRelativeAngleDeg(node.pos, detRot, dg.nodes[nIdx].pos, 
+                        $"RelationCheck_{chosen.name}_detection");
+                    
+                    // Calculate angle difference using the new, consistent method
+                    float angDiff = Mathf.Abs(Mathf.DeltaAngle(expectedAngle, actualAngle));
+                    
+                    // Debug logging for the new angle calculation method in relation checking
+                    if (debugLogRelativeAngles)
+                    {
+                        Debug.Log($"[RelationCheck] {chosen.name} vs {neighborPiece.name}: " +
+                                  $"Expected={expectedAngle:F2}°, Actual={actualAngle:F2}°, " +
+                                  $"Difference={angDiff:F2}°, Tolerance={relationMaxAngleDiffDeg:F2}°");
+                    }
+                    
+                    // For distance calculation, we still need the old vector approach
                     Vector3 vDet = node.pos - dg.nodes[nIdx].pos;
                     Vector3 vDiag = GetPieceCenterWorld(chosen) - GetPieceCenterWorld(neighborPiece);
-                // Project to diagram plane for stable angle
-                Vector3 planeN = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
-                Vector3 vDetP = Vector3.ProjectOnPlane(vDet, planeN);
-                Vector3 vDiagP = Vector3.ProjectOnPlane(vDiag, planeN);
-                float distDiff = Mathf.Abs(vDetP.magnitude - vDiagP.magnitude);
-                float angDiff = Mathf.Abs(Mathf.DeltaAngle(0f, Vector3.SignedAngle(vDetP.normalized, vDiagP.normalized, planeN)));
+                    // Project to diagram plane for stable angle
+                    Vector3 planeN = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
+                    Vector3 vDetP = Vector3.ProjectOnPlane(vDet, planeN);
+                    Vector3 vDiagP = Vector3.ProjectOnPlane(vDiag, planeN);
+                    float distDiff = Mathf.Abs(vDetP.magnitude - vDiagP.magnitude);
                 if (distDiff <= relationMaxDistDiff && angDiff <= relationMaxAngleDiffDeg)
                 {
                     Debug.Log($"[TangramMatcher] MATCH relation det({node.type})-det({dg.nodes[nIdx].type}) vs diag({chosen.name})-diag({neighborPiece.name}) diff(d)={distDiff:F3}m diff(deg)={angDiff:F1} deg");
@@ -2226,6 +2278,40 @@ public class TangramMatcher : MonoBehaviour
                                                     }
                                                     if (!neighMatched) continue;
 
+                                                    // ★ 변경점: 새로운 일관된 상대 각도 계산 함수를 사용하여 오류 보고의 정확성을 향상시킵니다.
+                                                    // Use the new, consistent relative angle calculation functions for error reporting accuracy
+                                                    
+                                                    // For detection positions, we need to find the detection's rotation
+                                                    Quaternion neighDetRot = Quaternion.identity;
+                                                    foreach (var r in lastMatchResults)
+                                                    {
+                                                        if (r.matchedPieceTransform == neighPiece)
+                                                        {
+                                                            neighDetRot = r.detectionWorldRotation;
+                                                            break;
+                                                        }
+                                                    }
+                                                    
+                                                    // Calculate expected angle from diagram using the new function
+                                                    float expectedAngle = ComputeRelativeAngleDegForDiagram(ls.piece, neighPiece, 
+                                                        $"ErrorReport_{ls.piece.name}_to_{neighPiece.name}");
+                                                    
+                                                    // Calculate actual angle from detection using the new function
+                                                    float actualAngle = ComputeRelativeAngleDeg(nearestDetPos, nearestDetRot, neighDetPos, 
+                                                        $"ErrorReport_{ls.piece.name}_detection");
+                                                    
+                                                    // Calculate angle difference using the new, consistent method
+                                                    float angDiff = Mathf.Abs(Mathf.DeltaAngle(expectedAngle, actualAngle));
+                                                    
+                                                    // Debug logging for the new angle calculation method
+                                                    if (debugLogRelativeAngles)
+                                                    {
+                                                        Debug.Log($"[ErrorReport] {ls.piece.name} vs {neighPiece.name}: " +
+                                                                  $"Expected={expectedAngle:F2}°, Actual={actualAngle:F2}°, " +
+                                                                  $"Difference={angDiff:F2}°, Tolerance={graphAngleToleranceDeg:F2}°");
+                                                    }
+                                                    
+                                                    // For distance calculation, we still need the old vector approach
                                                     Vector3 vDet = neighDetPos - nearestDetPos;
                                                     Vector3 vDiag = GetPieceCenterWorld(neighPiece) - centerLs;
                                                     Vector3 vDetP = Vector3.ProjectOnPlane(vDet, planeN);
@@ -2249,7 +2335,6 @@ public class TangramMatcher : MonoBehaviour
                                                     {
                                                         distDiff = Mathf.Abs(vDetP.magnitude - vDiagP.magnitude * scaleFactor);
                                                     }
-                                                    float angDiff = Mathf.Abs(Mathf.DeltaAngle(0f, Vector3.SignedAngle(vDetP.normalized, vDiagP.normalized, planeN)));
                                                     float cost = distDiff + rotationWeightMetersPerDeg * angDiff;
                                                     if (cost < bestLocalCost)
                                                     {
@@ -2258,37 +2343,43 @@ public class TangramMatcher : MonoBehaviour
                                                     }
                                                 }
                                             }
-                                            // Decide reason based on best relation and/or absolute orientation
+                                            // Enhanced debugging: Show all condition states instead of just the first failure
                                             if (!float.IsPositiveInfinity(bestLocalCost))
                                             {
                                                 string neighborName = bestFailNeighbor != null ? bestFailNeighbor.name : "unknown";
-                                                if (bestLocalDist > _dynamicGraphDistanceTolerance)
-                                                {
-                                                    detailedReason = $"vs '{neighborName}': Relational distance error ({bestLocalDist:F3}m) > tolerance ({_dynamicGraphDistanceTolerance:F3}m).";
-                                                }
-                                                else if (bestLocalAng > graphAngleToleranceDeg)
-                                                {
-                                                    detailedReason = $"vs '{neighborName}': Relational angle error ({bestLocalAng:F1}°) > tolerance ({graphAngleToleranceDeg:F1}°).";
-                                                }
-                                            }
-                                            // Absolute-orientation based reason, if enabled
-                                            if (string.IsNullOrEmpty(detailedReason) && useAbsoluteOrientation)
-                                            {
-                                                float absOriDeg = ComputeAngleError(ls.type, nearestDetRot, ls.piece);
-                                                if (absOriDeg > absoluteOrientationToleranceDeg)
-                                                {
-                                                    detailedReason = $"Absolute orientation error ({absOriDeg:F1}°) > tolerance ({absoluteOrientationToleranceDeg:F1}°).";
-                                                }
-                                            }
-                                            // Absolute distance fallback as a last resort
-                                            if (string.IsNullOrEmpty(detailedReason))
-                                            {
+                                                
+                                                // Check all condition states for comprehensive debugging
+                                                bool passDistance = bestLocalDist <= _dynamicGraphDistanceTolerance;
+                                                bool passAngle = bestLocalAng <= graphAngleToleranceDeg;
+                                                
+                                                // Calculate absolute orientation error for debugging
+                                                float absOriDeg = useAbsoluteOrientation ? ComputeAngleError(ls.type, nearestDetRot, ls.piece) : 0f;
+                                                bool passOrientation = !useAbsoluteOrientation || absOriDeg <= absoluteOrientationToleranceDeg;
+                                                
+                                                // Calculate absolute distance for debugging
                                                 Vector3 vAbsP = Vector3.ProjectOnPlane(nearestDetPos - centerLs, planeN);
                                                 float absDist = vAbsP.magnitude;
-                                                if (absDist > relockMaxDistanceMeters) // Use relock distance for a more relevant fallback
-                                                {
-                                                    detailedReason = $"Absolute distance to nearest detection ({absDist:F3}m) > tolerance ({relockMaxDistanceMeters:F3}m).";
-                                                }
+                                                bool passAbsoluteDistance = absDist <= relockMaxDistanceMeters;
+                                                
+                                                // Create comprehensive failure reason with all condition states
+                                                detailedReason = $"vs '{neighborName}': " +
+                                                               $"RelDist={bestLocalDist:F3}m({(passDistance?"PASS":"FAIL")}) " +
+                                                               $"RelAngle={bestLocalAng:F1}°({(passAngle?"PASS":"FAIL")}) " +
+                                                               $"AbsOri={absOriDeg:F1}°({(passOrientation?"PASS":"FAIL")}) " +
+                                                               $"AbsDist={absDist:F3}m({(passAbsoluteDistance?"PASS":"FAIL")}) " +
+                                                               $"Tolerances: d≤{_dynamicGraphDistanceTolerance:F3}m, a≤{graphAngleToleranceDeg:F1}°, " +
+                                                               $"o≤{absoluteOrientationToleranceDeg:F1}°, ad≤{relockMaxDistanceMeters:F3}m";
+                                            }
+                                            else
+                                            {
+                                                // Fallback case when no relational data is available
+                                                Vector3 vAbsP = Vector3.ProjectOnPlane(nearestDetPos - centerLs, planeN);
+                                                float absDist = vAbsP.magnitude;
+                                                bool passAbsoluteDistance = absDist <= relockMaxDistanceMeters;
+                                                
+                                                detailedReason = $"No relational data available. " +
+                                                               $"AbsDist={absDist:F3}m({(passAbsoluteDistance?"PASS":"FAIL")}) " +
+                                                               $"Tolerance: ≤{relockMaxDistanceMeters:F3}m";
                                             }
                                         }
                                         if (!string.IsNullOrEmpty(detailedReason))
@@ -2681,7 +2772,10 @@ AUGMENT:
                 distDiff = Mathf.Abs(vDet.magnitude - vDiag.magnitude * localScale);
             }
 
-            float angDiff = ComputePlanarAngleBetweenVectors(vDet, vDiag);
+            // Use new angle calculation method for consistency with other logging
+            float expectedAngle = ComputeRelativeAngleDegForDiagram(candidatePiece, neighborPiece, "RelationalCost");
+            float actualAngle = ComputeRelativeAngleDeg(center.pos, center.rot, dg.nodes[nIdx].pos, "RelationalCost");
+            float angDiff = Mathf.Abs(NormalizeAngle180(actualAngle - expectedAngle));
             float cost = distDiff + rotationWeightMetersPerDeg * angDiff;
 
             if (useAbsoluteDistanceInCost)
@@ -4876,6 +4970,12 @@ AUGMENT:
             int nonCornerCount = 0;
             for (int ii = 0; ii < latestDetections.Count; ii++) if (!latestDetections[ii].isCorner) nonCornerCount++;
             bool angleOnlyForTwoDetections = (nonCornerCount == 2);
+            
+            // New logic: track total neighbors and pass count for detailed evaluation
+            int totalNeighbors = 0;
+            int passCount = 0;
+            var perNeighborLines = new List<string>();
+            
             for (int e = 0; e < diagramGraph.nodes[idx].edges.Count; e++)
             {
                 var ed = diagramGraph.nodes[idx].edges[e];
@@ -4944,6 +5044,27 @@ AUGMENT:
                             }
                             bool passP = (angleOnlyForTwoDetections ? passAngP && passOriP : passDistP && passAngP && passOriP);
                             anyPass |= passP;
+                            
+                            // Track for detailed logging
+                            totalNeighbors++;
+                            if (passP) passCount++;
+                            
+                            // Add detailed neighbor result to list
+                            string proxyNeighborName = nbv.matchedPieceTransform != null ? nbv.matchedPieceTransform.name : "proxy";
+                            float proxyAbsOri = 0f;
+                            if (useAbsoluteOrientation)
+                            {
+                                // For proxy, we need to find the actual detection objects
+                                var proxyDetA = FindDetection(res.shapeType, res.arucoId);
+                                var proxyDetB = FindDetection(nbv.shapeType, nbv.arucoId);
+                                float proxyOriA = proxyDetA.HasValue ? ComputeAngleError(res.shapeType, proxyDetA.Value.worldRotation, piece) : 0f;
+                                float proxyOriB = proxyDetB.HasValue ? ComputeAngleError(nbv.shapeType, proxyDetB.Value.worldRotation, nbv.matchedPieceTransform) : 0f;
+                                proxyAbsOri = Mathf.Max(proxyOriA, proxyOriB);
+                            }
+                            perNeighborLines.Add($"{proxyNeighborName}: RelDist={dDiffP:F3}m({(passDistP?"PASS":"FAIL")}) " +
+                                               $"RelAngle={aDiffP:F1}°({(passAngP?"PASS":"FAIL")}) " +
+                                               $"AbsOri={proxyAbsOri:F1}°({(passOriP?"PASS":"FAIL")}) " +
+                                               $"AbsDist={dActP:F3}m");
                         }
                     }
                     continue;
@@ -5002,9 +5123,67 @@ AUGMENT:
                 bool pass = (angleOnlyForTwoDetections ? (passAng && passOri) : (passDist && passAng && passOri));
                 anyPass |= pass;
                 allPass &= pass;
+                
+                // Track for detailed logging
+                totalNeighbors++;
+                if (pass) passCount++;
+                
+                // Add detailed neighbor result to list
+                string neighborName = neighPiece != null ? neighPiece.name : "unknown";
+                float absDist = dAct;
+                float absOri = 0f;
+                if (useAbsoluteOrientation)
+                {
+                    var detA = FindDetection(res.shapeType, res.arucoId);
+                    var detB = FindDetection(nb.Value.shapeType, nb.Value.arucoId);
+                    float oriA = detA.HasValue ? ComputeAngleError(res.shapeType, detA.Value.worldRotation, piece) : 0f;
+                    float oriB = detB.HasValue ? ComputeAngleError(nb.Value.shapeType, detB.Value.worldRotation, neighPiece) : 0f;
+                    absOri = Mathf.Max(oriA, oriB);
+                }
+                perNeighborLines.Add($"{neighborName}: RelDist={dDiff:F3}m({(passDist?"PASS":"FAIL")}) " +
+                                   $"RelAngle={aDiff:F1}°({(passAng?"PASS":"FAIL")}) " +
+                                   $"AbsOri={absOri:F1}°({(passOri?"PASS":"FAIL")}) " +
+                                   $"AbsDist={absDist:F3}m");
             }
-            bool ok = requireAll ? allPass : anyPass;
-            reason = requireAll ? (allPass ? "all-pass" : "some-fail") : (anyPass ? (angleOnlyForTwoDetections ? "any-pass(angle-only)" : "any-pass") : "none-pass");
+            
+            // New evaluation logic: minimum neighbor count requirement instead of requireAll
+            bool ok;
+            if (totalNeighbors == 0)
+            {
+                ok = false;
+                reason = "no-neighbor-relations";
+            }
+            else if (requireAll)
+            {
+                // Legacy requireAll logic for backward compatibility
+                ok = allPass;
+                reason = allPass ? "all-pass" : "some-fail";
+            }
+            else
+            {
+                // New logic: minimum neighbor count requirement
+                ok = (passCount >= this.minNeighborsForLocked);
+                reason = ok ? $"neighbors {passCount}/{totalNeighbors} pass" 
+                           : $"neighbors {passCount}/{totalNeighbors} pass (need ≥{this.minNeighborsForLocked})";
+            }
+            
+            // Enhanced logging: show all neighbor results
+            if (perNeighborLines.Count > 0)
+            {
+                string pieceName = piece != null ? piece.name : "unknown";
+                string statusText = ok ? "REL PASS" : "MATCH FAILED";
+                string logMessage = $"[TangramMatcher] {statusText} '{pieceName}' {reason}\n" + string.Join(" | ", perNeighborLines);
+                
+                if (ok)
+                {
+                    Debug.Log(logMessage);
+                }
+                else
+                {
+                    Debug.LogWarning(logMessage);
+                }
+            }
+            
             return ok;
         }
         catch (Exception ex)
@@ -5493,6 +5672,7 @@ AUGMENT:
                         matchedPieceTransform = bestPiece,
                         worldDistanceMeters = absDist,
                         detectionWorldPosition = det.worldPosition,
+                        detectionWorldRotation = det.worldRotation, // ★ 추가: 감지된 도형의 회전 정보 저장
                         angleErrorDegrees = bestAng
                     });
                     if (debugLogOrientationDiff)
