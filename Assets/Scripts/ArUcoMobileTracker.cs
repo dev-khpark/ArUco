@@ -44,6 +44,13 @@ public class ArUcoMobileTracker : MonoBehaviour
     [Tooltip("게임 실행 중 카메라 변경을 위한 버튼 (테스트용)")]
     public bool switchCameraInRuntime = false;
 
+    [Header("Simulation (Editor)")]
+    [Tooltip("When set and active, frames come from the virtual mirror camera instead of the device camera. Editor-only by default.")]
+    public SimulatedTangramCamera simulatedCamera;
+    private bool UsingSimulation => simulatedCamera != null && simulatedCamera.ShouldSimulate;
+    private double defaultFx, defaultFy, defaultCx, defaultCy;
+    private float defaultMarkerLength;
+
     private WebCamTexture webcamTexture;
     private Texture2D texture;
     private Mat camMat;
@@ -213,11 +220,33 @@ public class ArUcoMobileTracker : MonoBehaviour
         camMatrix.put(2, 0, 0);  camMatrix.put(2, 1, 0);  camMatrix.put(2, 2, 1);
 
         distCoeffs = new MatOfDouble(0, 0, 0, 0); // 왜곡 계수 없음 처리
+        defaultFx = fx; defaultFy = fy; defaultCx = cx; defaultCy = cy;
+        defaultMarkerLength = markerLength;
 
         // 카메라 시작
         lastUseFrontCamera = useFrontCamera;
         lastSwitchCameraInRuntime = switchCameraInRuntime;
-        StartWebCam();
+        if (UsingSimulation)
+            Debug.Log("ArUcoMobileTracker: using the simulated mirror camera instead of the device camera.");
+        else
+            StartWebCam();
+    }
+
+    /// <summary>
+    /// Simulator frames: use its true calibration when requested, otherwise the same hard-coded values as on device,
+    /// so the simulation reproduces today's device behavior by default.
+    /// </summary>
+    private void ApplySimulatedCalibration()
+    {
+        double fx = defaultFx, fy = defaultFy, cx = defaultCx, cy = defaultCy;
+        double[] dist = { 0, 0, 0, 0 };
+        float length = defaultMarkerLength;
+        if (simulatedCamera.provideTrueCalibration)
+            simulatedCamera.GetCalibration(out fx, out fy, out cx, out cy, out dist, out length);
+        camMatrix.put(0, 0, fx); camMatrix.put(0, 2, cx);
+        camMatrix.put(1, 1, fy); camMatrix.put(1, 2, cy);
+        distCoeffs.fromArray(dist);
+        markerLength = length;
     }
 
     void RequestCameraPermission()
@@ -293,28 +322,38 @@ public class ArUcoMobileTracker : MonoBehaviour
 
     void Update()
     {
-        // Detect runtime camera change
-        if (lastUseFrontCamera != useFrontCamera || 
-            (switchCameraInRuntime && !lastSwitchCameraInRuntime))
+        if (UsingSimulation)
         {
-            lastUseFrontCamera = useFrontCamera;
-            lastSwitchCameraInRuntime = switchCameraInRuntime;
+            // Virtual mirror camera: already mirrored like the real reflector, so the flip below applies unchanged.
+            if (camMat == null) camMat = new Mat();
+            if (!simulatedCamera.TryGetFrame(camMat))
+                return;
+            ApplySimulatedCalibration();
+        }
+        else
+        {
+            // Detect runtime camera change
+            if (lastUseFrontCamera != useFrontCamera || 
+                (switchCameraInRuntime && !lastSwitchCameraInRuntime))
+            {
+                lastUseFrontCamera = useFrontCamera;
+                lastSwitchCameraInRuntime = switchCameraInRuntime;
+                
+                Debug.Log($"Camera change detected: Using front camera = {useFrontCamera}");
+                SwitchCamera();
+            }
             
-            Debug.Log($"Camera change detected: Using front camera = {useFrontCamera}");
-            SwitchCamera();
-        }
-        
-        if (webcamTexture == null || !webcamTexture.isPlaying || !webcamTexture.didUpdateThisFrame)
-            return;
+            if (webcamTexture == null || !webcamTexture.isPlaying || !webcamTexture.didUpdateThisFrame)
+                return;
 
-        // 카메라 프레임을 Mat으로 변환
-        if (camMat == null || camMat.width() != webcamTexture.width || camMat.height() != webcamTexture.height)
-        {
-            camMat = new Mat(webcamTexture.height, webcamTexture.width, CvType.CV_8UC3);
-        }
-    
+            // 카메라 프레임을 Mat으로 변환
+            if (camMat == null || camMat.width() != webcamTexture.width || camMat.height() != webcamTexture.height)
+            {
+                camMat = new Mat(webcamTexture.height, webcamTexture.width, CvType.CV_8UC3);
+            }
 
-        Utils.webCamTextureToMat(webcamTexture, camMat);
+            Utils.webCamTextureToMat(webcamTexture, camMat);
+        }
 
         //Flip camMat
         if (useFrontCamera)
