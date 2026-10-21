@@ -798,11 +798,91 @@ public class TangramMatcher : MonoBehaviour
         }
     }
 
+    // ---------- Game-facing API (read-only queries + reset) ----------
+
+    /// <summary>True while all 4 plane-corner markers are being tracked.</summary>
+    public bool PlaneCornersReady => planeCornersReady;
+
+    /// <summary>Time.time of the last SetDetections call. The tracker only calls it when at least one marker is visible.</summary>
+    public float LastDetectionsTime { get; private set; } = float.NegativeInfinity;
+
+    /// <summary>All answer pieces under the current diagram root.</summary>
+    public List<Transform> GetDiagramPieces()
+    {
+        var list = new List<Transform>();
+        foreach (TangramShapeType type in Enum.GetValues(typeof(TangramShapeType)))
+        {
+            if (diagramPiecesByType.TryGetValue(type, out var pieces)) list.AddRange(pieces);
+        }
+        return list;
+    }
+
+    /// <summary>Locked = relation-verified placement that survived recent frames. This is the "correctly placed" signal.</summary>
+    public bool IsPieceLocked(Transform piece)
+    {
+        return piece != null && lockedByPiece.TryGetValue(piece, out var ls) && ls.isLocked;
+    }
+
+    /// <summary>Matched in the latest pass but not necessarily verified (may still be an orientation-only guess).</summary>
+    public bool IsPieceMatchedThisFrame(Transform piece)
+    {
+        foreach (var r in lastMatchResults) if (r.matchedPieceTransform == piece) return true;
+        return false;
+    }
+
+    public Vector3 GetPieceCenter(Transform piece) => GetPieceCenterWorld(piece);
+
+    public static bool TryGetShapeTypeFromPieceName(string objectName, out TangramShapeType shapeType)
+        => TryInferShapeTypeFromName(objectName, out shapeType);
+
+    /// <summary>Pieces that share a diagram-graph edge with <paramref name="piece"/> (either direction).</summary>
+    public List<Transform> GetDiagramNeighbors(Transform piece)
+    {
+        var result = new List<Transform>();
+        if (piece == null || diagramGraph == null || !diagramGraph.indexByTransform.TryGetValue(piece, out int i)) return result;
+        for (int j = 0; j < diagramGraph.nodes.Count; j++)
+        {
+            if (j != i && IsDiagramEdge(i, j)) result.Add(diagramGraph.nodes[j].piece);
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Forget all matches/locks and first-pass calibration so a new round starts clean.
+    /// Corner-plane tracking is kept, so the board does not need to be re-acquired.
+    /// </summary>
+    public void ResetMatchingState()
+    {
+        lockedByPiece.Clear();
+        preAssignedDetections.Clear();
+        lastAssignedPieceByKey.Clear();
+        _matchedPiecesLastFrame.Clear();
+        lastMatchResults.Clear();
+        lastTypeErrorStats.Clear();
+        latestDetections.Clear();
+        recentDetectionsBuffer.Clear();
+        previousDetectionKeySet.Clear();
+        firstPassScaleValid = false; firstPassScale = 1f; firstPassScaleFrame = -1;
+        firstPassDirOffsetValid = false; firstPassDirOffsetDeg = 0f; firstPassDirOffsetFrame = -1;
+        cachedBaselineValid = false; cachedBaselineFrame = -1; cachedBaselineDetRef = 1f; cachedBaselineExpRef = 1f;
+        ApplyDebugColors(new HashSet<Transform>());
+    }
+
+    /// <summary>Switch to a different answer layout (puzzle) and start matching from scratch.</summary>
+    public void SetDiagramRoot(Transform root)
+    {
+        if (root == null) return;
+        ResetMatchingState();
+        tangramDiagramRoot = root;
+        RebuildDiagramCache();
+    }
+
     /// <summary>
     /// Feed detections in world space. Triggers matching and debug coloring.
     /// </summary>
     public void SetDetections(List<DetectedShape> detections)
     {
+        LastDetectionsTime = Time.time;
         // Reset dynamic tolerance at frame start
         _dynamicGraphDistanceTolerance = graphDistanceToleranceMeters;
         _detailedFailureReasons.Clear();
