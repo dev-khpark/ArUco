@@ -51,6 +51,14 @@ public class TangramMatcher : MonoBehaviour
 
     [Tooltip("한 조각이 여러 이웃 관계 중 첫 번째 'PASS' 관계를 만족하면 즉시 매칭을 확정합니다.")]
     public bool matchOnFirstPassingRelation = true;
+    [Tooltip("Among candidates that pass, pick the best fit (own orientation error + relative-angle error, in degrees) instead of the first one, " +
+             "and score each detection of a multi-detection type with its own orientation. Off = legacy: first passing candidate, and pairs of " +
+             "same-type detections (two large/small triangles) were scored with one detection's orientation and by absolute distance, which " +
+             "swaps congruent pieces whenever the camera image is rotated against the diagram.")]
+    public bool rankCandidatesByFit = true;
+    [Tooltip("Visit detections of locked pieces first and re-visit unmatched detections while the previous pass added matches. " +
+             "Off = legacy single pass by degree: a detection visited before any neighbor was matched stays unmatched for the frame.")]
+    public bool expandMatchingFrontier = true;
 
     [Tooltip("직전 프레임에 매칭됐던 조각이 잠시 매칭에 실패하는 경우(Flicker), 'MATCH FAILED' 경고를 억제합니다.")]
     public bool suppressFlickerWarnings = true;
@@ -193,6 +201,21 @@ public class TangramMatcher : MonoBehaviour
     public bool debugLogLockRelationDecision = true;
     [Tooltip("Immediately set lock (confidence=1.0) when relation pass condition is satisfied, instead of gradual confidence gain.")]
     public bool immediateLockOnRelationPass = true;
+    [Tooltip("Lock check compares the connection angle relative to the piece's own orientation (marker +X vs center→direction) on both sides, " +
+             "like the diagram edges and the matching cost do. Off = legacy: absolute line angle of the detections vs the diagram's relative angle, " +
+             "which only agree by chance and made locks random.")]
+    public bool lockRelationUsesRelativeAngles = true;
+    [Tooltip("Keep reporting a locked piece through its pre-assigned detection even when every piece of that type is locked. " +
+             "Off = legacy: such detections were skipped, so the lock counted as unseen, expired after maxUnseenFrames and re-locked (blinking).")]
+    public bool reportLockedPiecesOfExhaustedTypes = true;
+    [Tooltip("A locked piece follows the marker that verified it: re-association only accepts that ArUco id, and tracking starts from the detected position. " +
+             "Off = legacy: tracking started from the diagram piece's position (diagram frame, while detections are in the mapped camera frame), so the " +
+             "first re-association could hand a locked slot the other congruent piece's marker, and it then stayed locked swapped.")]
+    public bool trackLocksByMarker = true;
+    [Tooltip("Unlock a locked piece after this many consecutive frames in which it is seen and every relation to a locked neighbor fails " +
+             "(e.g. a lock that formed by chance while pieces were scattered, or a placed piece moved away). Relations to unlocked neighbors and " +
+             "frames without any locked neighbor (hand occlusion) never count. 0 = legacy: locks are only released after maxUnseenFrames unseen.")]
+    public int unlockAfterContradictedFrames = 10;
     [Header("Relation Best-Fit Options")]
     [Tooltip("When a neighbor's matched piece is not a direct diagram edge to the anchor, allow using the anchor's best-fit diagram neighbor (min expected diff) for REL logging.")]
     public bool allowBestFitEdgeForRelation = true;
@@ -245,6 +268,10 @@ public class TangramMatcher : MonoBehaviour
     public bool debugLogOrientationRejections = true;
     [Tooltip("When only one detection of a type exists but multiple diagram pieces of that type are present, assign to the piece with the smallest absolute orientation difference (ignoring relations).")]
     public bool forceOrientationForSingleDetection = true;
+    [Tooltip("Graph seed: assign the first detection to the same-type piece whose orientation fits best (within absoluteOrientationToleranceDeg), " +
+             "and skip seeding with detections that fit no piece. Off = legacy: highest graph degree, ignoring orientation, which often put " +
+             "one of two congruent triangles in the other's slot and blocked the whole frame.")]
+    public bool seedByAbsoluteOrientation = true;
     [Tooltip("Log per-piece orientation sweep (angle to every candidate piece) for each detection.")]
     public bool debugLogOrientationSweep = false;
     [Tooltip("Log per detection the absolute orientation difference to its assigned or best-matching diagram piece (independent of relations).")]
@@ -684,6 +711,8 @@ public class TangramMatcher : MonoBehaviour
         public Vector3 lastVelocity;
         public int lastSeenFrame;
         public bool isLocked;
+        public int markerId = -1; // ArUco id of the detection that last matched this piece
+        public int contradictedFrames; // consecutive frames in which every relation to a locked neighbor failed
         // Kalman state per axis: position/velocity and covariance terms
         public bool kalmanInitialized;
         public Vector3 kPos;
@@ -1103,6 +1132,7 @@ public class TangramMatcher : MonoBehaviour
                     var d = latestDetections[i];
                     if (d.isCorner) continue; // skip plane corner markers entirely
                     if (d.shapeType != ls.type) continue;
+                    if (trackLocksByMarker && ls.markerId >= 0 && d.arucoId != ls.markerId) continue;
 
                     bool pass;
                     float score;
@@ -1646,6 +1676,13 @@ public class TangramMatcher : MonoBehaviour
         var order = new List<int>();
         for (int i = 0; i < dg.nodes.Count; i++) order.Add(i);
         order.Sort((a, b) => dg.nodes[b].neighbors.Count.CompareTo(dg.nodes[a].neighbors.Count));
+        if (expandMatchingFrontier && enableStatefulMatching)
+        {
+            // Locked pieces anchor the frontier, so their pre-assigned detections go first.
+            var anchored = order.FindAll(i => preAssignedDetections.ContainsKey(dg.nodes[i].detIndex));
+            order.RemoveAll(i => preAssignedDetections.ContainsKey(dg.nodes[i].detIndex));
+            order.InsertRange(0, anchored);
+        }
 
         // Track which diagram pieces remain per type, skipping locked ones
         var remainingByType = new Dictionary<TangramShapeType, List<Transform>>();
@@ -1669,7 +1706,18 @@ public class TangramMatcher : MonoBehaviour
         var assignedDetectionIndices = new HashSet<int>();
         bool seeded = false;
 
-        for (int oi = 0; oi < order.Count; oi++)
+        // A detection visited before any of its neighbors was matched finds no candidate; re-visit the unmatched ones while the last pass added matches.
+        int assignedAtPassStart = 0;
+        bool RequeueUnmatched()
+        {
+            if (!expandMatchingFrontier || assignedDetectionIndices.Count == assignedAtPassStart) return false;
+            assignedAtPassStart = assignedDetectionIndices.Count;
+            int before = order.Count;
+            for (int i = 0; i < dg.nodes.Count; i++) if (!assignedDetectionIndices.Contains(i)) order.Add(i);
+            return order.Count > before;
+        }
+
+        for (int oi = 0; oi < order.Count || RequeueUnmatched(); oi++)
         {
             int nodeIdx = order[oi];
             if (assignedDetectionIndices.Contains(nodeIdx))
@@ -1677,7 +1725,11 @@ public class TangramMatcher : MonoBehaviour
             var node = dg.nodes[nodeIdx];
 
             if (!remainingByType.TryGetValue(node.type, out var candidates) || candidates.Count == 0)
-                continue;
+            {
+                // Locked pieces are not in remainingByType, so without this a type whose pieces are all locked never reports them.
+                if (!(reportLockedPiecesOfExhaustedTypes && enableStatefulMatching && preAssignedDetections.ContainsKey(node.detIndex)))
+                    continue;
+            }
 
             // Pre-assigned to locked piece?
             if (enableStatefulMatching)
@@ -1739,7 +1791,7 @@ public class TangramMatcher : MonoBehaviour
                 for (int oj = oi; oj < order.Count; oj++)
                 {
                     int candIdx = order[oj];
-                    if (assignedDetectionIndices.Contains(candIdx)) continue;
+                    if (assignedDetectionIndices.Contains(candIdx) || detIndices.Contains(candIdx)) continue; // order may hold re-visits
                     var candNode = dg.nodes[candIdx];
                     if (candNode.type != node.type) continue;
                     bool hasMatchedNeighbor = false;
@@ -1782,12 +1834,13 @@ public class TangramMatcher : MonoBehaviour
                                 }
                                 if (!TryComputeRelationalCostForCandidate(di, p, dg, detToPiece, out float d, out float a, out float usedScale, out int cnt))
                                     continue;
+                                int pairDetIndex = rankCandidatesByFit ? dg.nodes[di].detIndex : node.detIndex;
                                 // Unified REL-style gating: 2-detection → (angle OR ORI), otherwise → (dist AND (angle OR ORI))
                                 float absOriDegGate = 0f;
                                 bool passOriGate = true;
                                 if (useAbsoluteOrientation)
                                 {
-                                    var detGate = latestDetections[node.detIndex];
+                                    var detGate = latestDetections[pairDetIndex];
                                     absOriDegGate = ComputeAngleError(node.type, detGate.worldRotation, p);
                                     passOriGate = (absOriDegGate <= absoluteOrientationToleranceDeg);
                                 }
@@ -1869,7 +1922,7 @@ public class TangramMatcher : MonoBehaviour
                                     float cost = distanceCost2 + rotationWeightMetersPerDeg * a;
                                     if (useAbsoluteDistanceInCost)
                                     {
-                                        var detx = latestDetections[node.detIndex];
+                                        var detx = latestDetections[pairDetIndex];
                                         Vector3 planeN_abs = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
                                         Vector3 vAbs = Vector3.ProjectOnPlane(GetPieceCenterWorld(p) - detx.worldPosition, planeN_abs);
                                         float absDistX = vAbs.magnitude;
@@ -1886,17 +1939,17 @@ public class TangramMatcher : MonoBehaviour
                                     bool oriPassLocal = !useAbsoluteOrientation;
                                     if (useAbsoluteOrientation)
                                     {
-                                        var det = latestDetections[node.detIndex];
+                                        var det = latestDetections[pairDetIndex];
                                         // Use unified orientation error function to respect angleOffset and symmetry consistently
                                         float absOriDeg = ComputeAngleError(node.type, det.worldRotation, p);
                                         if (absOriDeg <= absoluteOrientationToleranceDeg) oriPassLocal = true;
                                         else if (debugLogOrientationRejections)
                                         {
-                                            Debug.Log($"[TangramMatcher] ORI REJECT det({node.type}:{latestDetections[node.detIndex].arucoId}) -> diag({p.name}) | absOri={absOriDeg:F1}° > tol={absoluteOrientationToleranceDeg:F1}°");
+                                            Debug.Log($"[TangramMatcher] ORI REJECT det({node.type}:{latestDetections[pairDetIndex].arucoId}) -> diag({p.name}) | absOri={absOriDeg:F1}° > tol={absoluteOrientationToleranceDeg:F1}°");
                                         }
                                         if (debugLogOrientationDiff)
                                         {
-                                            Debug.Log($"[TangramMatcher] ORI diff det({node.type}:{latestDetections[node.detIndex].arucoId}) -> diag({p.name}) | absOri={absOriDeg:F1}°");
+                                            Debug.Log($"[TangramMatcher] ORI diff det({node.type}:{latestDetections[pairDetIndex].arucoId}) -> diag({p.name}) | absOri={absOriDeg:F1}°");
                                         }
                                         cost += absoluteOrientationWeightMetersPerDeg * absOriDeg;
                                     }
@@ -1904,7 +1957,7 @@ public class TangramMatcher : MonoBehaviour
                                     bool anglePassLocal = (a <= graphAngleToleranceDeg);
                                     if (anglePassLocal && oriPassLocal)
                                     {
-                                        var detx2 = latestDetections[node.detIndex];
+                                        var detx2 = latestDetections[pairDetIndex];
                                         Vector3 planeN_abs2 = useXYPlane ? Vector3.forward : (tangramDiagramRoot != null ? tangramDiagramRoot.up : Vector3.up);
                                         Vector3 vAbs2 = Vector3.ProjectOnPlane(GetPieceCenterWorld(p) - detx2.worldPosition, planeN_abs2);
                                         float absDistPref = vAbs2.magnitude;
@@ -1912,7 +1965,7 @@ public class TangramMatcher : MonoBehaviour
                                     }
                                     if (preferPreviousAssignment)
                                     {
-                                        var key = (dg.nodes[di].type, latestDetections[node.detIndex].arucoId);
+                                        var key = (dg.nodes[di].type, latestDetections[pairDetIndex].arucoId);
                                         if (lastAssignedPieceByKey.TryGetValue(key, out var prev) && prev == p)
                                         {
                                             cost = Mathf.Max(0f, cost - previousAssignmentBiasMeters);
@@ -1921,7 +1974,7 @@ public class TangramMatcher : MonoBehaviour
                                         {
                                             if (preserveLockUnlessExtreme && lockedByPiece.TryGetValue(prevPiece, out var lsPrev))
                                             {
-                                                float extremeDist = Vector3.Distance(latestDetections[node.detIndex].worldPosition, lsPrev.lastPosition);
+                                                float extremeDist = Vector3.Distance(latestDetections[pairDetIndex].worldPosition, lsPrev.lastPosition);
                                                 if (extremeDist <= extremeReassignDistanceMeters)
                                                 {
                                                     cost += cooldownPenaltyMeters;
@@ -1929,6 +1982,8 @@ public class TangramMatcher : MonoBehaviour
                                             }
                                         }
                                     }
+                                    if (rankCandidatesByFit)
+                                        cost = absOriDegGate + a; // degrees; absolute positions are not in the diagram frame when the image is rotated
                                     pairs.Add((di, p, cost, d, a));
                                 }
                             }
@@ -2019,10 +2074,24 @@ public class TangramMatcher : MonoBehaviour
                 // Seed: pick diagram piece with highest graph degree among candidates
                 Transform best = null;
                 int bestDeg = -1;
+                float bestOri = float.PositiveInfinity;
+                bool byOrientation = seedByAbsoluteOrientation && useAbsoluteOrientation;
                 foreach (var p in filteredCandidates)
                 {
                     if (!diagramGraph.indexByTransform.TryGetValue(p, out int idx)) continue;
                     int deg = diagramGraph.nodes[idx].edges.Count;
+                    if (byOrientation)
+                    {
+                        float ori = ComputeAngleError(node.type, latestDetections[node.detIndex].worldRotation, p);
+                        if (ori > absoluteOrientationToleranceDeg) continue;
+                        if (ori < bestOri - 1e-3f || (Mathf.Abs(ori - bestOri) <= 1e-3f && deg > bestDeg))
+                        {
+                            bestOri = ori;
+                            bestDeg = deg;
+                            best = p;
+                        }
+                        continue;
+                    }
                     if (deg > bestDeg)
                     {
                         bestDeg = deg;
@@ -2044,6 +2113,7 @@ public class TangramMatcher : MonoBehaviour
 
                 if (matchOnFirstPassingRelation)
                 {
+                    float bestFit = float.PositiveInfinity;
                     foreach (var p in filteredCandidates)
                     {
                         if (TryComputeRelationalCostForCandidate(nodeIdx, p, dg, detToPiece, out float d, out float a, out float usedScale, out int cnt))
@@ -2053,7 +2123,19 @@ public class TangramMatcher : MonoBehaviour
                             bool passOri = !useAbsoluteOrientation || ComputeAngleError(node.type, latestDetections[node.detIndex].worldRotation, p) <= absoluteOrientationToleranceDeg;
                             bool pass = angleOnlyForTwoDetections ? (passAng && passOri) : (passDist && passAng && passOri);
 
-                            if (pass)
+                            if (pass && rankCandidatesByFit)
+                            {
+                                float fit = a + (useAbsoluteOrientation ? ComputeAngleError(node.type, latestDetections[node.detIndex].worldRotation, p) : 0f);
+                                if (fit < bestFit)
+                                {
+                                    bestFit = fit;
+                                    chosen = p;
+                                    chosenCost = 0f;
+                                    chosenAvgDistDiff = d;
+                                    chosenAvgAngDiff = a;
+                                }
+                            }
+                            else if (pass)
                             {
                                 chosen = p;
                                 chosenCost = 0f;
@@ -2262,10 +2344,21 @@ public class TangramMatcher : MonoBehaviour
                     if (requireRelationPassForLock)
                     {
                         // Check relations to matched neighbors along diagram edges
-                        relationPass = EvaluateRelationPassForPiece(ls.piece, relationLockRequireAllNeighbors, out string reason);
+                        relationPass = EvaluateRelationPassForPiece(ls.piece, relationLockRequireAllNeighbors, out string reason, out int lockedEvaluated, out int lockedPassed);
                         if (debugLogLockRelationDecision)
                         {
                             Debug.Log("[TangramMatcher] LOCK-REL " + ls.piece.name + " pass=" + (relationPass ? 1 : 0) + " all=" + (relationLockRequireAllNeighbors ? 1 : 0) + " " + reason);}
+                        bool contradicted = !relationPass && lockedEvaluated > 0 && lockedPassed == 0;
+                        ls.contradictedFrames = ls.isLocked && contradicted ? ls.contradictedFrames + 1 : 0;
+                        if (unlockAfterContradictedFrames > 0 && ls.contradictedFrames >= unlockAfterContradictedFrames)
+                        {
+                            ls.isLocked = false;
+                            ls.confidence = Mathf.Min(ls.confidence, unlockConfidenceThreshold - 0.01f);
+                            ls.kalmanInitialized = false;
+                            ls.contradictedFrames = 0;
+                            if (debugLogLockedStates)
+                                Debug.Log($"[TangramMatcher] Unlocked {ls.piece.name} ({ls.type}): relations to locked neighbors failed for {unlockAfterContradictedFrames} frames");
+                        }
                     }
                     if (relationPass)
                     {
@@ -2281,6 +2374,12 @@ public class TangramMatcher : MonoBehaviour
                     }
                     var last = ls.lastPosition;
                     var current = GetPieceCenterWorld(ls.piece);
+                    if (trackLocksByMarker)
+                    {
+                        // Follow the physical piece in the detections' frame, not the diagram piece in the diagram frame.
+                        foreach (var r in lastMatchResults)
+                            if (r.matchedPieceTransform == ls.piece) { current = r.detectionWorldPosition; ls.markerId = r.arucoId; break; }
+                    }
                     ls.lastVelocity = (current - last) / Mathf.Max(Time.deltaTime, 1e-3f);
                     ls.lastPosition = current;
                     ls.lastSeenFrame = frameCounter;
@@ -2494,7 +2593,8 @@ public class TangramMatcher : MonoBehaviour
                         piece = r.matchedPieceTransform,
                         type = r.shapeType,
                         confidence = confidenceGainPerHit,
-                        lastPosition = r.matchedPieceTransform.position,
+                        lastPosition = trackLocksByMarker ? r.detectionWorldPosition : r.matchedPieceTransform.position,
+                        markerId = r.arucoId,
                         lastVelocity = Vector3.zero,
                         lastSeenFrame = frameCounter,
                         isLocked = confidenceGainPerHit >= lockConfidenceThreshold
@@ -3810,7 +3910,8 @@ AUGMENT:
         float symmetry = GetSymmetryModuloDegrees(type);
         if (symmetry > 0f)
         {
-            rawAngle = rawAngle % symmetry;
+            // C# % keeps the sign of the dividend (-82 % 90 == -82), so fold into [0, symmetry) first.
+            rawAngle = Mathf.Repeat(rawAngle, symmetry);
             rawAngle = Mathf.Min(rawAngle, symmetry - rawAngle);
         }
 
@@ -5031,8 +5132,15 @@ AUGMENT:
 
     // Evaluate whether the given piece has at least one (or all) passing relations to matched neighbors along diagram edges this frame
     private bool EvaluateRelationPassForPiece(Transform piece, bool requireAll, out string reason)
+        => EvaluateRelationPassForPiece(piece, requireAll, out reason, out _, out _);
+
+    /// <param name="lockedNeighborsEvaluated">Relations evaluated against neighbors that are themselves locked.</param>
+    /// <param name="lockedNeighborsPassed">How many of those passed.</param>
+    private bool EvaluateRelationPassForPiece(Transform piece, bool requireAll, out string reason, out int lockedNeighborsEvaluated, out int lockedNeighborsPassed)
     {
         reason = "";
+        lockedNeighborsEvaluated = 0;
+        lockedNeighborsPassed = 0;
         try
         {
             if (diagramGraph == null || piece == null) { reason = "no-diagram"; return false; }
@@ -5083,8 +5191,17 @@ AUGMENT:
                             var nbv = proxy.Value;
                             float dActP = Vector3.ProjectOnPlane(nbv.detectionWorldPosition - res.detectionWorldPosition, planeN).magnitude;
                             float dExpP = GetDiagramExpectedDistanceBetweenPieces(piece, nbv.matchedPieceTransform);
-                            float aActP = ComputePlanarAngleDeg(res.detectionWorldPosition, nbv.detectionWorldPosition);
-                            float aExpP = ComputePlanarAngleDeg(GetPieceCenterWorld(piece), GetPieceCenterWorld(nbv.matchedPieceTransform));
+                            float aActP, aExpP;
+                            if (lockRelationUsesRelativeAngles)
+                            {
+                                aActP = ComputeRelativeAngleDeg(res.detectionWorldPosition, res.detectionWorldRotation, nbv.detectionWorldPosition);
+                                aExpP = ComputeRelativeAngleDegForDiagram(piece, nbv.matchedPieceTransform);
+                            }
+                            else
+                            {
+                                aActP = ComputePlanarAngleDeg(res.detectionWorldPosition, nbv.detectionWorldPosition);
+                                aExpP = ComputePlanarAngleDeg(GetPieceCenterWorld(piece), GetPieceCenterWorld(nbv.matchedPieceTransform));
+                            }
                             float dDiffP = 0f; bool passDistP = true;
                             if (!angleOnlyForTwoDetections)
                             {
@@ -5124,6 +5241,7 @@ AUGMENT:
                             }
                             bool passP = (angleOnlyForTwoDetections ? passAngP && passOriP : passDistP && passAngP && passOriP);
                             anyPass |= passP;
+                            if (IsPieceLocked(nbv.matchedPieceTransform)) { lockedNeighborsEvaluated++; if (passP) lockedNeighborsPassed++; }
                             
                             // Track for detailed logging
                             totalNeighbors++;
@@ -5152,16 +5270,26 @@ AUGMENT:
                 // Compute actual planar distance/angle
                 float dAct = Vector3.ProjectOnPlane(nb.Value.detectionWorldPosition - res.detectionWorldPosition, planeN).magnitude;
                 float dExp = ed.expectedDistanceMeters;
-                float aAct;
-                var detA4 = FindDetection(res.shapeType, res.arucoId);
-                var detB4 = FindDetection(nb.Value.shapeType, nb.Value.arucoId);
-                if (detA4.HasValue && detB4.HasValue)
-                    aAct = (detA4.Value.arucoId <= detB4.Value.arucoId)
-                        ? ComputePlanarAngleFromPlaneCoords(detA4.Value.planeCoord, detB4.Value.planeCoord, 4)
-                        : ComputePlanarAngleFromPlaneCoords(detB4.Value.planeCoord, detA4.Value.planeCoord, 4);
+                float aAct, aExp;
+                if (lockRelationUsesRelativeAngles)
+                {
+                    // ed.expectedAngleDeg is relative to the lower-ID diagram piece's direction; measure both sides from this piece instead,
+                    // so a marker swap between congruent pieces cannot flip the reference.
+                    aAct = ComputeRelativeAngleDeg(res.detectionWorldPosition, res.detectionWorldRotation, nb.Value.detectionWorldPosition);
+                    aExp = ComputeRelativeAngleDegForDiagram(piece, neighPiece);
+                }
                 else
-                    aAct = ComputePlanarAngleDeg(res.detectionWorldPosition, nb.Value.detectionWorldPosition);
-                float aExp = ed.expectedAngleDeg;
+                {
+                    var detA4 = FindDetection(res.shapeType, res.arucoId);
+                    var detB4 = FindDetection(nb.Value.shapeType, nb.Value.arucoId);
+                    if (detA4.HasValue && detB4.HasValue)
+                        aAct = (detA4.Value.arucoId <= detB4.Value.arucoId)
+                            ? ComputePlanarAngleFromPlaneCoords(detA4.Value.planeCoord, detB4.Value.planeCoord, 4)
+                            : ComputePlanarAngleFromPlaneCoords(detB4.Value.planeCoord, detA4.Value.planeCoord, 4);
+                    else
+                        aAct = ComputePlanarAngleDeg(res.detectionWorldPosition, nb.Value.detectionWorldPosition);
+                    aExp = ed.expectedAngleDeg;
+                }
                 float dDiff = 0f;
                 bool passDist = true;
                 if (!angleOnlyForTwoDetections)
@@ -5203,6 +5331,7 @@ AUGMENT:
                 bool pass = (angleOnlyForTwoDetections ? (passAng && passOri) : (passDist && passAng && passOri));
                 anyPass |= pass;
                 allPass &= pass;
+                if (IsPieceLocked(neighPiece)) { lockedNeighborsEvaluated++; if (pass) lockedNeighborsPassed++; }
                 
                 // Track for detailed logging
                 totalNeighbors++;
